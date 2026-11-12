@@ -6902,6 +6902,177 @@ unsigned lodepng_encode24_file(const char* filename, const unsigned char* image,
 }
 #endif /*LODEPNG_COMPILE_DISK*/
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / APNG Encoder                                                           / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*write the chunks shared with a regular PNG that appear before IDAT, but no
+ancillary chunks other than PLTE and tRNS*/
+static unsigned addAPNGChunks_beforeIDAT(ucvector* out, const LodePNGInfo* info, unsigned w, unsigned h) {
+  unsigned error = addChunk_IHDR(out, w, h, info->color.colortype, info->color.bitdepth, 0);
+  if(error) return error;
+  if(info->color.colortype == LCT_PALETTE) {
+    error = addChunk_PLTE(out, &info->color);
+    if(error) return error;
+  }
+  return addChunk_tRNS(out, &info->color);
+}
+
+/*add an acTL chunk: number of frames and number of plays (0 = infinite loop)*/
+static unsigned addChunk_acTL(ucvector* out, unsigned num_frames, unsigned num_plays) {
+  unsigned char data[8];
+  lodepng_set32bitInt(data + 0, num_frames);
+  lodepng_set32bitInt(data + 4, num_plays);
+  return lodepng_chunk_createv(out, 8, "acTL", data);
+}
+
+/*add an fcTL chunk. seq_num is the animation sequence number shared by the
+fcTL/fdAT chunks and must be unique, increasing in order of appearance.
+Full-canvas frames only are emitted (x_offset = y_offset = 0, width = w,
+height = h).*/
+static unsigned addChunk_fcTL(ucvector* out, unsigned seq_num, unsigned w, unsigned h,
+                              const LodePNGFrame* frame) {
+  unsigned char data[26];
+  unsigned delay_den = frame->delay_den == 0 ? 100u : frame->delay_den;
+  lodepng_set32bitInt(data + 0, seq_num);
+  lodepng_set32bitInt(data + 4, w);
+  lodepng_set32bitInt(data + 8, h);
+  lodepng_set32bitInt(data + 12, 0); /*x_offset*/
+  lodepng_set32bitInt(data + 16, 0); /*y_offset*/
+  data[20] = (unsigned char)((frame->delay_num >> 8) & 0xff);
+  data[21] = (unsigned char)(frame->delay_num & 0xff);
+  /*the APNG specification says a delay denominator of 0 must be treated as 100*/
+  data[22] = (unsigned char)((delay_den >> 8) & 0xff);
+  data[23] = (unsigned char)(delay_den & 0xff);
+  data[24] = (unsigned char)frame->dispose_op;
+  data[25] = (unsigned char)frame->blend_op;
+  return lodepng_chunk_createv(out, 26, "fcTL", data);
+}
+
+/*add an fdAT chunk: 4-byte sequence number followed by the zlib stream of the
+frame's filtered scanlines*/
+static unsigned addChunk_fdAT(ucvector* out, unsigned seq_num,
+                              const unsigned char* data, size_t datasize,
+                              const LodePNGCompressSettings* zlibsettings) {
+  unsigned error = 0;
+  unsigned char* zlib = 0;
+  size_t zlibsize = 0;
+  error = zlib_compress(&zlib, &zlibsize, data, datasize, zlibsettings);
+  if(!error) {
+    unsigned char* chunk = 0;
+    CERROR_TRY_RETURN(lodepng_chunk_init(&chunk, out, zlibsize + 4, "fdAT"));
+    lodepng_set32bitInt(chunk + 8, seq_num);
+    lodepng_memcpy(chunk + 12, zlib, zlibsize);
+    lodepng_chunk_generate_crc(chunk);
+  }
+  lodepng_free(zlib);
+  return error;
+}
+
+unsigned lodepng_encode_apng(unsigned char** out, size_t* outsize,
+                             const LodePNGFrame* frames, unsigned num_frames,
+                             unsigned w, unsigned h,
+                             LodePNGColorType colortype, unsigned bitdepth,
+                             unsigned num_plays) {
+  LodePNGState state;
+  LodePNGInfo info;
+  ucvector outv = ucvector_init(NULL, 0);
+  unsigned char* converted = 0;
+  unsigned char* data = 0;
+  size_t datasize = 0;
+  size_t rawsize;
+  unsigned i, seq_num = 0, error = 0;
+
+  *out = 0;
+  *outsize = 0;
+
+  if(num_frames == 0) return 84; /*given image too small to contain all pixels to be encoded*/
+
+  /*one frame is a plain PNG: keep the regular encoder path byte for byte*/
+  if(num_frames == 1) {
+    return lodepng_encode_memory(out, outsize, frames[0].buffer, w, h, colortype, bitdepth);
+  }
+  for(i = 0; i != num_frames; ++i) {
+    if(frames[i].dispose_op > LDO_DISPOSE_BACKGROUND || frames[i].blend_op > LBO_BLEND_OVER) {
+      return 124; /*invalid APNG dispose_op or blend_op*/
+    }
+    if(frames[i].delay_den > 65535u || frames[i].delay_num > 65535u) return 125; /*APNG delay out of range*/
+  }
+
+  lodepng_state_init(&state);
+  lodepng_info_init(&info);
+  state.info_raw.colortype = colortype;
+  state.info_raw.bitdepth = bitdepth;
+  state.info_png.color.colortype = colortype;
+  state.info_png.color.bitdepth = bitdepth;
+  /*all frames share one output color type: the one requested by the caller*/
+  state.encoder.auto_convert = 0;
+
+  error = checkColorValidity(colortype, bitdepth);
+  if(error) goto cleanup;
+
+  error = lodepng_info_copy(&info, &state.info_png);
+  if(error) goto cleanup;
+
+  rawsize = lodepng_get_raw_size(w, h, &info.color);
+  error = writeSignature(&outv);
+  if(error) goto cleanup;
+  error = addAPNGChunks_beforeIDAT(&outv, &info, w, h);
+  if(error) goto cleanup;
+  error = addChunk_acTL(&outv, num_frames, num_plays);
+  if(error) goto cleanup;
+
+  /*the last sequence number is 2 * num_frames - 2, check it fits in 32 bits*/
+  if(num_frames > 0x80000001u) return 125; /*animation sequence number out of range*/
+
+  for(i = 0; i != num_frames; ++i) {
+    error = addChunk_fcTL(&outv, seq_num++, w, h, &frames[i]);
+    if(error) goto cleanup;
+    converted = (unsigned char*)lodepng_malloc(rawsize);
+    if(!converted && rawsize) { error = 83; goto cleanup; }
+    error = lodepng_convert(converted, frames[i].buffer, &info.color, &state.info_raw, w, h);
+    if(error) goto cleanup;
+    error = preProcessScanlines(&data, &datasize, converted, w, h, &info, &state.encoder);
+    lodepng_free(converted);
+    converted = 0;
+    if(error) goto cleanup;
+    if(i == 0) {
+      error = addChunk_IDAT(&outv, data, datasize, &state.encoder.zlibsettings);
+    } else {
+      error = addChunk_fdAT(&outv, seq_num++, data, datasize, &state.encoder.zlibsettings);
+    }
+    lodepng_free(data);
+    data = 0;
+    if(error) goto cleanup;
+  }
+  error = addChunk_IEND(&outv);
+
+cleanup:
+  lodepng_free(converted);
+  lodepng_free(data);
+  lodepng_info_cleanup(&info);
+  lodepng_state_cleanup(&state);
+  *out = outv.data;
+  *outsize = outv.size;
+  return error;
+}
+
+#ifdef LODEPNG_COMPILE_DISK
+unsigned lodepng_encode_apng_file(const char* filename,
+                                  const LodePNGFrame* frames, unsigned num_frames,
+                                  unsigned w, unsigned h,
+                                  LodePNGColorType colortype, unsigned bitdepth,
+                                  unsigned num_plays) {
+  unsigned char* buffer;
+  size_t buffersize;
+  unsigned error = lodepng_encode_apng(&buffer, &buffersize, frames, num_frames,
+                                       w, h, colortype, bitdepth, num_plays);
+  if(!error) error = lodepng_save_file(buffer, buffersize, filename);
+  lodepng_free(buffer);
+  return error;
+}
+#endif /*LODEPNG_COMPILE_DISK*/
+
 void lodepng_encoder_settings_init(LodePNGEncoderSettings* settings) {
   lodepng_compress_settings_init(&settings->zlibsettings);
   settings->filter_palette_zero = 1;
@@ -7055,6 +7226,8 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "invalid APNG dispose_op or blend_op";
+    case 125: return "APNG frame delay numerator or denominator out of range";
   }
   return "unknown error code";
 }
@@ -7250,6 +7423,22 @@ unsigned encode(std::vector<unsigned char>& out,
   return encode(out, in.empty() ? 0 : &in[0], w, h, state);
 }
 
+unsigned encode_apng(std::vector<unsigned char>& out,
+                     const LodePNGFrame* frames, unsigned num_frames,
+                     unsigned w, unsigned h,
+                     LodePNGColorType colortype, unsigned bitdepth,
+                     unsigned num_plays) {
+  unsigned char* buffer;
+  size_t buffersize;
+  unsigned error = lodepng_encode_apng(&buffer, &buffersize, frames, num_frames,
+                                       w, h, colortype, bitdepth, num_plays);
+  if(buffer) {
+    out.insert(out.end(), buffer, &buffer[buffersize]);
+    lodepng_free(buffer);
+  }
+  return error;
+}
+
 #ifdef LODEPNG_COMPILE_DISK
 unsigned encode(const std::string& filename,
                 const unsigned char* in, unsigned w, unsigned h,
@@ -7265,6 +7454,17 @@ unsigned encode(const std::string& filename,
                 LodePNGColorType colortype, unsigned bitdepth) {
   if(lodepng_get_raw_size_lct(w, h, colortype, bitdepth) > in.size()) return 84;
   return encode(filename, in.empty() ? 0 : &in[0], w, h, colortype, bitdepth);
+}
+
+unsigned encode_apng(const std::string& filename,
+                     const LodePNGFrame* frames, unsigned num_frames,
+                     unsigned w, unsigned h,
+                     LodePNGColorType colortype, unsigned bitdepth,
+                     unsigned num_plays) {
+  std::vector<unsigned char> buffer;
+  unsigned error = encode_apng(buffer, frames, num_frames, w, h, colortype, bitdepth, num_plays);
+  if(!error) error = save_file(buffer, filename);
+  return error;
 }
 #endif /* LODEPNG_COMPILE_DISK */
 #endif /* LODEPNG_COMPILE_ENCODER */

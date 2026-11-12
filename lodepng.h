@@ -132,6 +132,31 @@ typedef enum LodePNGColorType {
   LCT_MAX_OCTET_VALUE = 255
 } LodePNGColorType;
 
+#ifdef LODEPNG_COMPILE_ENCODER
+/*APNG frame disposal operation (fcTL dispose_op), see the APNG specification:
+https://wiki.mozilla.org/APNG_Specification*/
+typedef enum LodePNGDisposeOp {
+  LDO_DISPOSE_NONE = 0, /*frame remains in place after rendering*/
+  LDO_DISPOSE_BACKGROUND = 1 /*frame's region is cleared to fully transparent black*/
+} LodePNGDisposeOp;
+
+/*APNG frame blend operation (fcTL blend_op)*/
+typedef enum LodePNGBlendOp {
+  LBO_BLEND_SOURCE = 0, /*frame's region is replaced by the frame's contents*/
+  LBO_BLEND_OVER = 1 /*frame's contents are alpha-composited over the output buffer*/
+} LodePNGBlendOp;
+
+/*One frame of an APNG animation. All frames must have the same width, height,
+colortype and bitdepth as given to lodepng_encode_apng.*/
+typedef struct LodePNGFrame {
+  const unsigned char* buffer; /*raw pixel data of this frame*/
+  unsigned delay_num; /*frame duration numerator*/
+  unsigned delay_den; /*frame duration denominator, in seconds (e.g. 1000 for ms)*/
+  LodePNGDisposeOp dispose_op; /*LDO_DISPOSE_NONE or LDO_DISPOSE_BACKGROUND*/
+  LodePNGBlendOp blend_op; /*LBO_BLEND_SOURCE or LBO_BLEND_OVER*/
+} LodePNGFrame;
+#endif /*LODEPNG_COMPILE_ENCODER*/
+
 #ifdef LODEPNG_COMPILE_DECODER
 /*
 Converts PNG data in memory to raw pixel data.
@@ -217,6 +242,24 @@ unsigned lodepng_encode32(unsigned char** out, size_t* outsize,
 unsigned lodepng_encode24(unsigned char** out, size_t* outsize,
                           const unsigned char* image, unsigned w, unsigned h);
 
+/*
+Converts multiple raw frames into an APNG (animated PNG) image in memory.
+Each frame has its own delay, dispose_op and blend_op; see LodePNGFrame.
+The first frame is stored in the regular IDAT chunk, following frames in fdAT
+chunks, with acTL and fcTL chunks written as defined by the APNG specification.
+frames: array of num_frames LodePNGFrame structs, each holding raw pixels of
+        w * h pixels in the given colortype/bitdepth.
+num_frames: amount of frames (must be at least 1).
+num_plays: amount of times the animation loops, 0 means infinite looping.
+With a single frame the output is identical to lodepng_encode_memory.
+Return value: LodePNG error code (0 means no error).
+*/
+unsigned lodepng_encode_apng(unsigned char** out, size_t* outsize,
+                             const LodePNGFrame* frames, unsigned num_frames,
+                             unsigned w, unsigned h,
+                             LodePNGColorType colortype, unsigned bitdepth,
+                             unsigned num_plays);
+
 #ifdef LODEPNG_COMPILE_DISK
 /*
 Converts raw pixel data into a PNG file on disk.
@@ -243,6 +286,15 @@ NOTE: Wide-character filenames are not supported, you can use an external method
 to handle such files and encode in-memory.*/
 unsigned lodepng_encode24_file(const char* filename,
                                const unsigned char* image, unsigned w, unsigned h);
+
+/*Same as lodepng_encode_apng, but writes the result to a file on disk.
+
+NOTE: This overwrites existing files without warning!*/
+unsigned lodepng_encode_apng_file(const char* filename,
+                                  const LodePNGFrame* frames, unsigned num_frames,
+                                  unsigned w, unsigned h,
+                                  LodePNGColorType colortype, unsigned bitdepth,
+                                  unsigned num_plays);
 #endif /*LODEPNG_COMPILE_DISK*/
 #endif /*LODEPNG_COMPILE_ENCODER*/
 
@@ -281,6 +333,12 @@ unsigned encode(std::vector<unsigned char>& out,
 unsigned encode(std::vector<unsigned char>& out,
                 const std::vector<unsigned char>& in, unsigned w, unsigned h,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
+/*Same as lodepng_encode_apng, but encodes to an std::vector.*/
+unsigned encode_apng(std::vector<unsigned char>& out,
+                     const LodePNGFrame* frames, unsigned num_frames,
+                     unsigned w, unsigned h,
+                     LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8,
+                     unsigned num_plays = 0);
 #ifdef LODEPNG_COMPILE_DISK
 /*
 Converts 32-bit RGBA raw pixel data into a PNG file on disk.
@@ -297,6 +355,12 @@ unsigned encode(const std::string& filename,
 unsigned encode(const std::string& filename,
                 const std::vector<unsigned char>& in, unsigned w, unsigned h,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
+/*Same as lodepng_encode_apng, but writes the result to a file on disk.*/
+unsigned encode_apng(const std::string& filename,
+                     const LodePNGFrame* frames, unsigned num_frames,
+                     unsigned w, unsigned h,
+                     LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8,
+                     unsigned num_plays = 0);
 #endif /* LODEPNG_COMPILE_DISK */
 #endif /* LODEPNG_COMPILE_ENCODER */
 } /* namespace lodepng */
