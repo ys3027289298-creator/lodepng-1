@@ -25,6 +25,7 @@ freely, subject to the following restrictions:
 
 #include "lodepng_util.h"
 #include <stdlib.h> /* allocations */
+#include <math.h> /* floor, pow */
 
 namespace lodepng {
 
@@ -1455,5 +1456,173 @@ unsigned convertFromSrgb(unsigned char* out, const unsigned char* in,
 }
 
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+
+/*
+Grayscale 8-bit image enhancement pipeline, for grayish, unevenly distributed
+material. The steps run in a fixed order, each can be toggled on/off and each
+has its own independent parameters:
+  1) quantile clip   (quantileClipGray8)
+  2) linear stretch  (linearStretchGray8)
+  3) histogram equalization (histogramEqualizeGray8)
+  4) optional sRGB conversion (srgbConvertGray8)
+
+Shared return values of these functions:
+0: success
+1: quantile clip parameters out of range (requires 0 <= low < high <= 1)
+2: linear stretch parameters out of range (requires 0 <= out_min < out_max <= 255)
+3: sRGB direction out of range (requires 0 or 1)
+10: uniform image (e.g. all black or all white): the step is not applied,
+    its result is undefined due to a zero range, so no division by zero happens
+*/
+
+static void histogramGray8(const unsigned char* data, size_t n, size_t hist[256]) {
+  size_t i;
+  for(i = 0; i != 256; ++i) hist[i] = 0;
+  for(i = 0; i != n; ++i) ++hist[data[i]];
+}
+
+/* Variance of the pixel value distribution described by the image histogram.
+Returns 0 for an empty image. */
+double histogramVarianceGray8(const unsigned char* data, size_t n) {
+  size_t hist[256];
+  size_t i;
+  double mean = 0.0, var = 0.0;
+  if(n == 0) return 0.0;
+  histogramGray8(data, n, hist);
+  for(i = 0; i != 256; ++i) mean += (double)i * (double)hist[i];
+  mean /= (double)n;
+  for(i = 0; i != 256; ++i) {
+    double d = (double)i - mean;
+    var += d * d * (double)hist[i];
+  }
+  return var / (double)n;
+}
+
+/* Clamps all pixel values to the [low, high] quantile range of the histogram. */
+unsigned quantileClipGray8(unsigned char* data, size_t n, double low, double high) {
+  size_t hist[256];
+  size_t i, cum;
+  double tlo, thi;
+  unsigned char lo_val = 0, hi_val = 255;
+  if(!(low >= 0.0 && low <= 1.0) || !(high >= 0.0 && high <= 1.0) || !(low < high)) return 1;
+  if(n == 0) return 0;
+  histogramGray8(data, n, hist);
+  tlo = low * (double)n; if(tlo < 1.0) tlo = 1.0;
+  thi = high * (double)n; if(thi < 1.0) thi = 1.0;
+  cum = 0;
+  for(i = 0; i != 256; ++i) {
+    cum += hist[i];
+    if((double)cum >= tlo) { lo_val = (unsigned char)i; break; }
+  }
+  cum = 0;
+  for(i = 0; i != 256; ++i) {
+    cum += hist[i];
+    if((double)cum >= thi) { hi_val = (unsigned char)i; break; }
+  }
+  for(i = 0; i != n; ++i) {
+    if(data[i] < lo_val) data[i] = lo_val;
+    else if(data[i] > hi_val) data[i] = hi_val;
+  }
+  return 0;
+}
+
+/* Linearly maps the current [min, max] range of the image to [out_min, out_max]. */
+unsigned linearStretchGray8(unsigned char* data, size_t n, double out_min, double out_max) {
+  size_t i;
+  unsigned char lo = 255, hi = 0;
+  double scale, v;
+  if(!(out_min >= 0.0 && out_min <= 255.0) || !(out_max >= 0.0 && out_max <= 255.0) ||
+     !(out_min < out_max)) return 2;
+  if(n == 0) return 0;
+  for(i = 0; i != n; ++i) {
+    if(data[i] < lo) lo = data[i];
+    if(data[i] > hi) hi = data[i];
+  }
+  if(lo == hi) return 10; /* uniform image: zero range, do not divide by zero */
+  scale = (out_max - out_min) / (double)(hi - lo);
+  for(i = 0; i != n; ++i) {
+    v = out_min + (double)(data[i] - lo) * scale;
+    v = floor(v + 0.5);
+    if(v < 0.0) v = 0.0;
+    if(v > 255.0) v = 255.0;
+    data[i] = (unsigned char)v;
+  }
+  return 0;
+}
+
+/* Standard CDF based histogram equalization to the full 0..255 range. */
+unsigned histogramEqualizeGray8(unsigned char* data, size_t n) {
+  size_t hist[256], cdf[256];
+  size_t i, cum = 0, cdf_min = 0;
+  unsigned char map[256];
+  if(n == 0) return 0;
+  histogramGray8(data, n, hist);
+  for(i = 0; i != 256; ++i) {
+    cum += hist[i];
+    cdf[i] = cum;
+    if(cdf_min == 0 && cum != 0) cdf_min = cum;
+  }
+  if(cdf_min == n) return 10; /* uniform image: zero denominator, do not divide by zero */
+  for(i = 0; i != 256; ++i) {
+    double v = (double)(cdf[i] - cdf_min) * 255.0 / (double)(n - cdf_min);
+    v = floor(v + 0.5);
+    if(v < 0.0) v = 0.0;
+    if(v > 255.0) v = 255.0;
+    map[i] = (unsigned char)v;
+  }
+  for(i = 0; i != n; ++i) data[i] = map[data[i]];
+  return 0;
+}
+
+/* sRGB transfer function. direction 0: linear to sRGB (encode), 1: sRGB to linear (decode). */
+unsigned srgbConvertGray8(unsigned char* data, size_t n, unsigned direction) {
+  size_t i;
+  if(direction > 1) return 3;
+  for(i = 0; i != n; ++i) {
+    double c = (double)data[i] / 255.0;
+    double s;
+    if(direction == 0) {
+      s = (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    } else {
+      s = (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+    }
+    s = floor(s * 255.0 + 0.5);
+    if(s < 0.0) s = 0.0;
+    if(s > 255.0) s = 255.0;
+    data[i] = (unsigned char)s;
+  }
+  return 0;
+}
+
+/*
+Runs the full enhancement pipeline in the fixed order: quantile clip, linear
+stretch, histogram equalization, sRGB conversion. Each step runs only if its
+toggle is enabled, and only an enabled step's parameters are validated.
+Returns the first non-zero status of any step, 0 if all steps succeeded.
+*/
+unsigned enhancePipelineGray8(unsigned char* data, size_t n,
+                              bool clip_on, double clip_low, double clip_high,
+                              bool stretch_on, double stretch_min, double stretch_max,
+                              bool equalize_on,
+                              bool srgb_on, unsigned srgb_direction) {
+  unsigned error = 0;
+  if(clip_on) {
+    error = quantileClipGray8(data, n, clip_low, clip_high);
+    if(error) return error;
+  }
+  if(stretch_on) {
+    error = linearStretchGray8(data, n, stretch_min, stretch_max);
+    if(error) return error;
+  }
+  if(equalize_on) {
+    error = histogramEqualizeGray8(data, n);
+    if(error) return error;
+  }
+  if(srgb_on) {
+    error = srgbConvertGray8(data, n, srgb_direction);
+    if(error) return error;
+  }
+  return 0;
+}
 
 } // namespace lodepng
