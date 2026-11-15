@@ -5533,8 +5533,21 @@ unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
                         LodePNGState* state,
                         const unsigned char* in, size_t insize) {
   *out = 0;
-  decodeGeneric(out, w, h, state, in, insize);
-  if(state->error) goto cleanup;
+  if(in && insize >= 4 && in[0] == 'q' && in[1] == 'o' && in[2] == 'i' && in[3] == 'f') {
+    /*QOI image instead of PNG: decode to 32-bit RGBA, then use the regular
+    color conversion below to convert to the user requested color type*/
+    state->error = lodepng_decode_qoi(out, w, h, in, insize);
+    if(state->error) goto cleanup;
+    /*reset info_png like lodepng_inspect does for a new image, then describe
+    the decoded QOI data: always 32-bit RGBA*/
+    lodepng_info_cleanup(&state->info_png);
+    lodepng_info_init(&state->info_png);
+    state->info_png.color.colortype = LCT_RGBA;
+    state->info_png.color.bitdepth = 8;
+  } else {
+    decodeGeneric(out, w, h, state, in, insize);
+    if(state->error) goto cleanup;
+  }
   if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
     /*same color type, no copying or converting of data needed*/
     /*store the info_png color settings on the info_raw so that the info_raw still reflects what colortype
@@ -5635,6 +5648,117 @@ void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
   settings->ignore_critical = 0;
   settings->ignore_end = 0;
   lodepng_decompress_settings_init(&settings->zlibsettings);
+}
+
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / QOI Decoder                                                            / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+Decoder for QOI (Quite OK Image) images. Always outputs 32-bit RGBA
+(8 bits per channel), both for 3-channel (RGB) and 4-channel (RGBA) images.
+Supports all QOI opcodes: QOI_OP_RGB, QOI_OP_RGBA, QOI_OP_INDEX, QOI_OP_DIFF
+(differential encoding), QOI_OP_LUMA and QOI_OP_RUN.
+*/
+
+#define LODEPNG_QOI_HEADER_SIZE 14
+#define LODEPNG_QOI_END_MARKER_SIZE 8
+
+static unsigned lodepng_qoi_color_hash(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+  return (r * 3u + g * 5u + b * 7u + a * 11u) & 63u;
+}
+
+unsigned lodepng_decode_qoi(unsigned char** out, unsigned* w, unsigned* h,
+                            const unsigned char* in, size_t insize) {
+  size_t i, pos, num_pixels, outsize, dataend;
+  unsigned char* image;
+  unsigned char index[64][4]; /*index of previously seen pixel values, for QOI_OP_INDEX*/
+  unsigned char r, g, b, a;
+  unsigned run = 0;
+  static const unsigned char end_marker[LODEPNG_QOI_END_MARKER_SIZE] = {0, 0, 0, 0, 0, 0, 0, 1};
+
+  /* safe output values in case error happens */
+  *out = 0;
+  *w = *h = 0;
+
+  if(!in) return 48; /*the given data is empty*/
+  if(insize < LODEPNG_QOI_HEADER_SIZE + LODEPNG_QOI_END_MARKER_SIZE) return 124; /*too small for header and end marker*/
+  if(in[0] != 'q' || in[1] != 'o' || in[2] != 'i' || in[3] != 'f') return 124; /*invalid QOI magic bytes*/
+  *w = lodepng_read32bitInt(&in[4]);
+  *h = lodepng_read32bitInt(&in[8]);
+  if(*w == 0 || *h == 0) return 125; /*zero width or height is invalid*/
+  if(in[12] != 3 && in[12] != 4) return 126; /*channels must be 3 (RGB) or 4 (RGBA)*/
+  if(in[13] > 1) return 127; /*colorspace must be 0 (sRGB) or 1 (linear)*/
+  for(i = 0; i < LODEPNG_QOI_END_MARKER_SIZE; i++) {
+    if(in[insize - LODEPNG_QOI_END_MARKER_SIZE + i] != end_marker[i]) return 130; /*invalid QOI end marker*/
+  }
+
+  num_pixels = (size_t)(*w) * (size_t)(*h);
+  if(num_pixels / (size_t)(*w) != (size_t)(*h) || num_pixels > ((size_t)(-1)) / 4) {
+    return 92; /*integer overflow due to too many pixels*/
+  }
+  outsize = num_pixels * 4;
+
+  image = (unsigned char*)lodepng_malloc(outsize);
+  if(!image) return 83; /*alloc fail*/
+
+  lodepng_memset(index, 0, sizeof(index));
+  r = 0; g = 0; b = 0; a = 255; /*initial pixel value as defined by the QOI specification*/
+  pos = LODEPNG_QOI_HEADER_SIZE;
+  dataend = insize - LODEPNG_QOI_END_MARKER_SIZE;
+
+  for(i = 0; i < num_pixels; i++) {
+    if(run > 0) {
+      /*continuation of a QOI_OP_RUN: repeat the previous pixel value*/
+      run--;
+    } else {
+      unsigned char b1;
+      if(pos >= dataend) { lodepng_free(image); return 128; } /*truncated pixel data*/
+      b1 = in[pos++];
+      if(b1 == 0xFE) { /*QOI_OP_RGB*/
+        if(pos + 3 > dataend) { lodepng_free(image); return 128; } /*truncated pixel data*/
+        r = in[pos]; g = in[pos + 1]; b = in[pos + 2];
+        pos += 3;
+      } else if(b1 == 0xFF) { /*QOI_OP_RGBA*/
+        if(pos + 4 > dataend) { lodepng_free(image); return 128; } /*truncated pixel data*/
+        r = in[pos]; g = in[pos + 1]; b = in[pos + 2]; a = in[pos + 3];
+        pos += 4;
+      } else if((b1 & 0xC0) == 0x00) { /*QOI_OP_INDEX*/
+        const unsigned char* px = index[b1 & 0x3F];
+        r = px[0]; g = px[1]; b = px[2]; a = px[3];
+      } else if((b1 & 0xC0) == 0x40) { /*QOI_OP_DIFF: small differential encoding*/
+        r = (unsigned char)(r + (((b1 >> 4) & 3) - 2));
+        g = (unsigned char)(g + (((b1 >> 2) & 3) - 2));
+        b = (unsigned char)(b + ((b1 & 3) - 2));
+      } else if((b1 & 0xC0) == 0x80) { /*QOI_OP_LUMA: differential encoding based on green*/
+        int dg, dr_dg, db_dg;
+        unsigned char b2;
+        if(pos >= dataend) { lodepng_free(image); return 128; } /*truncated pixel data*/
+        b2 = in[pos++];
+        dg = (b1 & 0x3F) - 32;
+        dr_dg = ((b2 >> 4) & 0xF) - 8;
+        db_dg = (b2 & 0xF) - 8;
+        r = (unsigned char)(r + dg + dr_dg);
+        g = (unsigned char)(g + dg);
+        b = (unsigned char)(b + dg + db_dg);
+      } else { /*QOI_OP_RUN: repeat the previous pixel value run + 1 times in total*/
+        run = b1 & 0x3F;
+        if(run > num_pixels - 1 - i) { lodepng_free(image); return 129; } /*run exceeds remaining pixels*/
+      }
+      /*update the index of previously seen pixel values*/
+      index[lodepng_qoi_color_hash(r, g, b, a)][0] = r;
+      index[lodepng_qoi_color_hash(r, g, b, a)][1] = g;
+      index[lodepng_qoi_color_hash(r, g, b, a)][2] = b;
+      index[lodepng_qoi_color_hash(r, g, b, a)][3] = a;
+    }
+    image[i * 4 + 0] = r;
+    image[i * 4 + 1] = g;
+    image[i * 4 + 2] = b;
+    image[i * 4 + 3] = a;
+  }
+
+  *out = image;
+  return 0;
 }
 
 #endif /*LODEPNG_COMPILE_DECODER*/
@@ -7055,6 +7179,13 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "invalid QOI image: too small for the QOI header or wrong magic bytes";
+    case 125: return "QOI image has zero width or height";
+    case 126: return "invalid QOI channels value, must be 3 (RGB) or 4 (RGBA)";
+    case 127: return "invalid QOI colorspace value, must be 0 or 1";
+    case 128: return "QOI pixel data is truncated";
+    case 129: return "QOI run length exceeds the amount of remaining pixels";
+    case 130: return "invalid QOI end marker";
   }
   return "unknown error code";
 }
@@ -7176,6 +7307,23 @@ unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h, const
 unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
                 const std::vector<unsigned char>& in, LodePNGColorType colortype, unsigned bitdepth) {
   return decode(out, w, h, in.empty() ? 0 : &in[0], (unsigned)in.size(), colortype, bitdepth);
+}
+
+unsigned decode_qoi(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
+                    const unsigned char* in, size_t insize) {
+  unsigned char* buffer = 0;
+  unsigned error = lodepng_decode_qoi(&buffer, &w, &h, in, insize);
+  if(buffer && !error) {
+    size_t buffersize = (size_t)w * (size_t)h * 4; /*QOI always decodes to 32-bit RGBA*/
+    out.insert(out.end(), buffer, &buffer[buffersize]);
+  }
+  lodepng_free(buffer);
+  return error;
+}
+
+unsigned decode_qoi(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
+                    const std::vector<unsigned char>& in) {
+  return decode_qoi(out, w, h, in.empty() ? 0 : &in[0], in.size());
 }
 
 unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h,

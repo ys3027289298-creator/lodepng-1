@@ -135,6 +135,8 @@ typedef enum LodePNGColorType {
 #ifdef LODEPNG_COMPILE_DECODER
 /*
 Converts PNG data in memory to raw pixel data.
+If the input starts with the QOI magic bytes ("qoif"), it is decoded as QOI
+instead of PNG (see lodepng_decode_qoi).
 out: Output parameter. Pointer to buffer that will contain the raw pixel data.
      After decoding, its size is w * h * (bytes per pixel) bytes larger than
      initially. Bytes per pixel depends on colortype and bitdepth.
@@ -159,6 +161,16 @@ unsigned lodepng_decode32(unsigned char** out, unsigned* w, unsigned* h,
 /*Same as lodepng_decode_memory, but always decodes to 24-bit RGB raw image*/
 unsigned lodepng_decode24(unsigned char** out, unsigned* w, unsigned* h,
                           const unsigned char* in, size_t insize);
+
+/*
+Decodes QOI (Quite OK Image) data in memory to raw pixel data.
+Always decodes to 32-bit RGBA (8 bits per channel), both for 3-channel (RGB)
+and 4-channel (RGBA) QOI images. Supports all QOI opcodes, including the
+differential (QOI_OP_DIFF) and luma (QOI_OP_LUMA) encodings.
+out, w, h, in, insize and the return value behave as in lodepng_decode_memory.
+*/
+unsigned lodepng_decode_qoi(unsigned char** out, unsigned* w, unsigned* h,
+                            const unsigned char* in, size_t insize);
 
 #ifdef LODEPNG_COMPILE_DISK
 /*
@@ -258,6 +270,11 @@ unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
 unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
                 const std::vector<unsigned char>& in,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
+/*Same as lodepng_decode_qoi, but decodes to an std::vector. Always 32-bit RGBA.*/
+unsigned decode_qoi(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
+                    const unsigned char* in, size_t insize);
+unsigned decode_qoi(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
+                    const std::vector<unsigned char>& in);
 #ifdef LODEPNG_COMPILE_DISK
 /*
 Converts PNG file from disk to raw pixel data in memory.
@@ -1459,6 +1476,13 @@ for all C-style structs:
 
 Decoding converts a PNG compressed image to a raw pixel buffer.
 
+As an exception, the decoder also supports QOI (Quite OK Image) images: if the
+input starts with the QOI magic bytes ("qoif"), it is decoded as QOI instead of
+PNG. QOI images always decode to 32-bit RGBA, which is then converted to the
+requested color type if needed. QOI can also be decoded directly with
+lodepng_decode_qoi. The QOI decoder supports 3-channel (RGB) and 4-channel
+(RGBA) images and all QOI opcodes, including differential encoding.
+
 Most documentation on using the decoder is at its declarations in the header
 above. For C, simple decoding can be done with functions such as
 lodepng_decode32, and more advanced decoding can be done with the struct
@@ -2018,6 +2042,9 @@ symbol.
 Not all changes are listed here, the commit history in github lists more:
 https://github.com/lvandeve/lodepng
 
+*) 15 nov 2026: added QOI decoding: lodepng_decode_qoi, and the generic decode
+   functions auto-detect QOI images by their magic bytes. QOI always decodes
+   to 32-bit RGBA, which is then converted to the requested color type.
 *) 6 may 2025 (!): renamed mDCv to mDCV and cLLi to cLLI as per the recent
    rename in the draft png third edition spec. Please note that as long as the
    third edition is not finalized, backwards-incompatible changes to its

@@ -1029,6 +1029,231 @@ void testPNGCodec() {
   }
 }
 
+//Minimal QOI encoder, used only to generate test images for the QOI decoder tests
+static void qoiEncodeForTest(std::vector<unsigned char>& out, const std::vector<unsigned char>& rgba,
+                             unsigned w, unsigned h, unsigned channels) {
+  size_t i, n = (size_t)w * (size_t)h;
+  unsigned char index[64][4];
+  unsigned char pr = 0, pg = 0, pb = 0, pa = 255;
+  unsigned run = 0;
+  out.push_back('q'); out.push_back('o'); out.push_back('i'); out.push_back('f');
+  out.push_back((unsigned char)((w >> 24) & 255)); out.push_back((unsigned char)((w >> 16) & 255));
+  out.push_back((unsigned char)((w >> 8) & 255)); out.push_back((unsigned char)(w & 255));
+  out.push_back((unsigned char)((h >> 24) & 255)); out.push_back((unsigned char)((h >> 16) & 255));
+  out.push_back((unsigned char)((h >> 8) & 255)); out.push_back((unsigned char)(h & 255));
+  out.push_back((unsigned char)channels);
+  out.push_back(0); //colorspace sRGB
+  for(i = 0; i < 64; i++) index[i][0] = index[i][1] = index[i][2] = index[i][3] = 0;
+  for(i = 0; i < n; i++) {
+    unsigned char r = rgba[i * 4 + 0], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+    if(r == pr && g == pg && b == pb && a == pa) {
+      run++;
+      if(run == 62 || i == n - 1) { out.push_back((unsigned char)(0xC0 | (run - 1))); run = 0; }
+    } else {
+      unsigned hash;
+      if(run > 0) { out.push_back((unsigned char)(0xC0 | (run - 1))); run = 0; }
+      hash = (r * 3u + g * 5u + b * 7u + a * 11u) & 63u;
+      if(index[hash][0] == r && index[hash][1] == g && index[hash][2] == b && index[hash][3] == a) {
+        out.push_back((unsigned char)hash); //QOI_OP_INDEX
+      } else {
+        int dr, dg, db;
+        index[hash][0] = r; index[hash][1] = g; index[hash][2] = b; index[hash][3] = a;
+        dr = (int)r - (int)pr; if(dr > 127) dr -= 256; if(dr < -128) dr += 256;
+        dg = (int)g - (int)pg; if(dg > 127) dg -= 256; if(dg < -128) dg += 256;
+        db = (int)b - (int)pb; if(db > 127) db -= 256; if(db < -128) db += 256;
+        if(a == pa && dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1) {
+          out.push_back((unsigned char)(0x40 | ((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2))); //QOI_OP_DIFF
+        } else if(a == pa && dg >= -32 && dg <= 31 && dr - dg >= -8 && dr - dg <= 7 && db - dg >= -8 && db - dg <= 7) {
+          out.push_back((unsigned char)(0x80 | (dg + 32))); //QOI_OP_LUMA
+          out.push_back((unsigned char)(((dr - dg + 8) << 4) | (db - dg + 8)));
+        } else if(a == pa) {
+          out.push_back(0xFE); out.push_back(r); out.push_back(g); out.push_back(b); //QOI_OP_RGB
+        } else {
+          out.push_back(0xFF); out.push_back(r); out.push_back(g); out.push_back(b); out.push_back(a); //QOI_OP_RGBA
+        }
+      }
+    }
+    pr = r; pg = g; pb = b; pa = a;
+  }
+  for(i = 0; i < 7; i++) out.push_back(0);
+  out.push_back(1); //end marker
+}
+
+void testQOI() {
+  std::cout << "testQOI" << std::endl;
+
+  //Handcrafted 4x2 RGB QOI image, using QOI_OP_RGB, QOI_OP_DIFF, QOI_OP_RUN and QOI_OP_INDEX
+  {
+    unsigned char data[] = {
+      'q', 'o', 'i', 'f', 0, 0, 0, 4, 0, 0, 0, 2, 3, 0,
+      0xFE, 10, 20, 30, //QOI_OP_RGB -> (10,20,30,255)
+      0x7F, //QOI_OP_DIFF (+1,+1,+1) -> (11,21,31,255)
+      0xC0, //QOI_OP_RUN 1 -> (11,21,31,255)
+      0x09, //QOI_OP_INDEX -> (10,20,30,255)
+      0xFE, 200, 100, 50, //QOI_OP_RGB -> (200,100,50,255)
+      0x1F, //QOI_OP_INDEX -> (200,100,50,255)
+      0x76, //QOI_OP_DIFF (+1,-1,0) -> (201,99,50,255)
+      0xC0, //QOI_OP_RUN 1 -> (201,99,50,255)
+      0, 0, 0, 0, 0, 0, 0, 1
+    };
+    unsigned char expected[] = {
+      10, 20, 30, 255,  11, 21, 31, 255,  11, 21, 31, 255,  10, 20, 30, 255,
+      200, 100, 50, 255,  200, 100, 50, 255,  201, 99, 50, 255,  201, 99, 50, 255
+    };
+    unsigned char* out = 0;
+    unsigned w = 0, h = 0;
+    assertNoError(lodepng_decode_qoi(&out, &w, &h, data, sizeof(data)));
+    assertEquals(4, w);
+    assertEquals(2, h);
+    for(size_t i = 0; i < sizeof(expected); i++) assertEquals(expected[i], out[i]);
+    free(out);
+    //the generic decode functions must auto-detect QOI and give the same 32-bit RGBA result
+    out = 0; w = h = 0;
+    assertNoError(lodepng_decode32(&out, &w, &h, data, sizeof(data)));
+    assertEquals(4, w);
+    assertEquals(2, h);
+    for(size_t i = 0; i < sizeof(expected); i++) assertEquals(expected[i], out[i]);
+    free(out);
+    //decoding to 24-bit RGB drops the alpha channel through the regular color conversion
+    out = 0; w = h = 0;
+    assertNoError(lodepng_decode24(&out, &w, &h, data, sizeof(data)));
+    for(size_t i = 0; i < 8; i++) {
+      assertEquals(expected[i * 4 + 0], out[i * 3 + 0]);
+      assertEquals(expected[i * 4 + 1], out[i * 3 + 1]);
+      assertEquals(expected[i * 4 + 2], out[i * 3 + 2]);
+    }
+    free(out);
+  }
+
+  //Handcrafted 3x2 RGBA QOI image, using QOI_OP_RGBA, QOI_OP_LUMA, QOI_OP_DIFF, QOI_OP_RUN and QOI_OP_INDEX
+  {
+    unsigned char data[] = {
+      'q', 'o', 'i', 'f', 0, 0, 0, 3, 0, 0, 0, 2, 4, 1,
+      0xFF, 100, 150, 200, 128, //QOI_OP_RGBA -> (100,150,200,128)
+      0xAA, 0x83, //QOI_OP_LUMA (dg=10, dr-dg=0, db-dg=-5) -> (110,160,205,128)
+      0x7F, //QOI_OP_DIFF (+1,+1,+1) -> (111,161,206,128)
+      0xC0, //QOI_OP_RUN 1 -> (111,161,206,128)
+      0x05, //QOI_OP_INDEX -> (110,160,205,128)
+      0x12, //QOI_OP_INDEX -> (100,150,200,128)
+      0, 0, 0, 0, 0, 0, 0, 1
+    };
+    unsigned char expected[] = {
+      100, 150, 200, 128,  110, 160, 205, 128,  111, 161, 206, 128,
+      111, 161, 206, 128,  110, 160, 205, 128,  100, 150, 200, 128
+    };
+    std::vector<unsigned char> out;
+    unsigned w = 0, h = 0;
+    assertNoError(lodepng::decode_qoi(out, w, h, data, sizeof(data)));
+    assertEquals(3, w);
+    assertEquals(2, h);
+    assertEquals(sizeof(expected), out.size());
+    for(size_t i = 0; i < sizeof(expected); i++) assertEquals(expected[i], out[i]);
+    //the generic C++ decode must auto-detect QOI as well
+    std::vector<unsigned char> in(data, data + sizeof(data));
+    std::vector<unsigned char> out2;
+    assertNoError(lodepng::decode(out2, w, h, in));
+    assertEquals(out.size(), out2.size());
+    for(size_t i = 0; i < out.size(); i++) assertEquals(out[i], out2[i]);
+  }
+
+  //Round trip: encode RGBA and RGB images with the test encoder, decode, compare pixels exactly
+  for(unsigned channels = 3; channels <= 4; channels++) {
+    unsigned w = 13, h = 7;
+    std::vector<unsigned char> rgba(w * h * 4), qoi, decoded;
+    for(size_t i = 0; i < w * h; i++) {
+      //pattern with runs, small deltas and jumps to trigger all QOI opcodes
+      unsigned v = (unsigned)((i * 7 + i / 3 * 41) & 63);
+      rgba[i * 4 + 0] = (unsigned char)(v + 10);
+      rgba[i * 4 + 1] = (unsigned char)(v * 2 + (i > 40 ? 100 : 0));
+      rgba[i * 4 + 2] = (unsigned char)(255 - v);
+      rgba[i * 4 + 3] = (unsigned char)(channels == 3 ? 255 : (i % 5 == 0 ? 128 : 255));
+    }
+    unsigned dw = 0, dh = 0;
+    qoiEncodeForTest(qoi, rgba, w, h, channels);
+    assertNoError(lodepng::decode_qoi(decoded, dw, dh, qoi));
+    assertEquals(w, dw);
+    assertEquals(h, dh);
+    assertEquals(rgba.size(), decoded.size());
+    for(size_t i = 0; i < rgba.size(); i++) assertEquals(rgba[i], decoded[i]);
+  }
+
+  //Error paths: each invalid input must give its specific error code
+  {
+    unsigned char valid[] = {
+      'q', 'o', 'i', 'f', 0, 0, 0, 1, 0, 0, 0, 1, 3, 0,
+      0xFE, 10, 20, 30,
+      0, 0, 0, 0, 0, 0, 0, 1
+    };
+    unsigned char* out = 0;
+    unsigned w = 0, h = 0;
+    std::vector<unsigned char> v(valid, valid + sizeof(valid));
+
+    assertNoError(lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    free(out); out = 0;
+
+    //too small for header + end marker
+    assertEquals(124, lodepng_decode_qoi(&out, &w, &h, &v[0], 13));
+    //null input
+    assertEquals(48, lodepng_decode_qoi(&out, &w, &h, 0, 100));
+    assertEquals(48, lodepng_decode32(&out, &w, &h, 0, 100));
+    //wrong magic bytes
+    v[0] = 'Q';
+    assertEquals(124, lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    v[0] = 'q';
+    //zero width
+    v[7] = 0;
+    assertEquals(125, lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    v[7] = 1;
+    //invalid channels
+    v[12] = 2;
+    assertEquals(126, lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    v[12] = 3;
+    //invalid colorspace
+    v[13] = 5;
+    assertEquals(127, lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    v[13] = 0;
+    //invalid end marker
+    v[v.size() - 1] = 0;
+    assertEquals(130, lodepng_decode_qoi(&out, &w, &h, &v[0], v.size()));
+    v[v.size() - 1] = 1;
+    //truncated pixel data: 1x1 image with valid end marker but no pixel chunks
+    {
+      unsigned char truncated[] = {
+        'q', 'o', 'i', 'f', 0, 0, 0, 1, 0, 0, 0, 1, 3, 0,
+        0, 0, 0, 0, 0, 0, 0, 1
+      };
+      assertEquals(128, lodepng_decode_qoi(&out, &w, &h, truncated, sizeof(truncated)));
+    }
+    //run length exceeds the remaining pixels (1x1 image, run of 2)
+    {
+      unsigned char runoverflow[] = {
+        'q', 'o', 'i', 'f', 0, 0, 0, 1, 0, 0, 0, 1, 4, 0,
+        0xC1, //QOI_OP_RUN 2, but only 1 pixel in the image
+        0, 0, 0, 0, 0, 0, 0, 1
+      };
+      assertEquals(129, lodepng_decode_qoi(&out, &w, &h, runoverflow, sizeof(runoverflow)));
+    }
+    //on error the output pointer stays 0
+    assertTrue(out == 0);
+    //all new error codes have an error text
+    for(unsigned code = 124; code <= 130; code++) {
+      assertTrue(std::string(lodepng_error_text(code)) != "unknown error code");
+    }
+  }
+
+  //The PNG decoding path is unaffected: a PNG buffer must not be detected as QOI
+  {
+    std::vector<unsigned char> png, rgba(2 * 2 * 4, 128);
+    unsigned w = 0, h = 0;
+    std::vector<unsigned char> out;
+    assertNoError(lodepng::encode(png, rgba, 2, 2));
+    assertNoError(lodepng::decode(out, w, h, png));
+    assertEquals(2, w);
+    assertEquals(2, h);
+    for(size_t i = 0; i < rgba.size(); i++) assertEquals(rgba[i], out[i]);
+  }
+}
+
 //Tests some specific color conversions with specific color bit combinations
 void testColorConvert() {
   //test color conversions to RGBA8
@@ -3963,6 +4188,9 @@ void doMain() {
   testBkgdChunk();
   testBkgdChunk2();
   testSbitChunk();
+
+  //QOI
+  testQOI();
 
   //Colors
 #ifndef DISABLE_SLOW
