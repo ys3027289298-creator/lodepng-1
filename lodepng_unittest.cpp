@@ -3945,6 +3945,220 @@ void testErrorImages() {
   testBase64Image("iVBORw0KGgoAAAANSUhEUgAAAQAAAAEAAgMAAAAhHED1AAAAU0lEQVR4Ae3MwQAAAAxFoXnM3/NDvGsBdB8JBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEEQDHGPAW1eyhK0AAAAASUVORK5CYII=", true, 256, 256, "");
 }
 
+/*Small self-made RGBA image: smooth gradients (prone to color banding) plus a
+flat region and an alpha ramp, kept tiny so the whole test runs in one go.*/
+static void makeQuantizeSample(std::vector<unsigned char>& image,
+                               unsigned& w, unsigned& h) {
+  unsigned x, y;
+  w = 12;
+  h = 9;
+  image.resize((size_t)w * h * 4);
+  for(y = 0; y < h; y++) {
+    for(x = 0; x < w; x++) {
+      size_t i = ((size_t)y * w + x) * 4;
+      image[i + 0] = (unsigned char)(x * 255 / (w - 1));
+      image[i + 1] = (unsigned char)(y * 255 / (h - 1));
+      image[i + 2] = (unsigned char)((x + y) * 255 / (w + h - 2));
+      image[i + 3] = (unsigned char)(x * 255 / (w - 1));
+    }
+  }
+}
+
+static size_t countDistinct(const std::vector<unsigned char>& image, unsigned channels) {
+  std::vector<unsigned char> seen;
+  size_t p, i, c;
+  size_t npixels = image.size() / channels;
+  for(p = 0; p < npixels; p++) {
+    int is_new = 1;
+    for(i = 0; i + channels <= seen.size(); i += channels) {
+      int same = 1;
+      for(c = 0; c < channels; c++) {
+        if(seen[i + c] != image[p * channels + c]) same = 0;
+      }
+      if(same) { is_new = 0; break; }
+    }
+    if(is_new) {
+      for(c = 0; c < channels; c++) seen.push_back(image[p * channels + c]);
+    }
+  }
+  return seen.size() / channels;
+}
+
+static void runQuantizeMode(const std::vector<unsigned char>& image,
+                            unsigned w, unsigned h, unsigned levels,
+                            LodePNGQuantizeMode mode, unsigned strength,
+                            const char* label) {
+  std::vector<unsigned char> out;
+  LodePNGQuantizeStats stats;
+  unsigned error = lodepng::quantize(out, image, w, h, 4, levels, mode,
+                                     strength, &stats);
+  std::vector<unsigned char> png;
+  unsigned png_error;
+  ASSERT_NO_PNG_ERROR(error);
+  ASSERT_EQUALS(image.size(), out.size());
+  ASSERT_EQUALS(countDistinct(out, 4), stats.distinct_colors);
+  ASSERT_EQUALS(out.size(), stats.output_size);
+
+  png_error = lodepng::encode(png, out, w, h, LCT_RGBA, 8);
+  ASSERT_NO_PNG_ERROR(png_error);
+
+  std::cout << "  " << label
+            << ": levels=" << levels << " strength=" << strength
+            << " distinct_colors=" << stats.distinct_colors
+            << " raw_bytes=" << stats.output_size
+            << " png_bytes=" << png.size()
+            << " mae(r/g/b)/1000=" << stats.mae_milli[0] << "/"
+            << stats.mae_milli[1] << "/" << stats.mae_milli[2]
+            << " rmse(r/g/b)/1000=" << stats.rmse_milli[0] << "/"
+            << stats.rmse_milli[1] << "/" << stats.rmse_milli[2]
+            << std::endl;
+}
+
+void testQuantize() {
+  std::cout << "testQuantize" << std::endl;
+  unsigned w, h;
+  std::vector<unsigned char> image;
+  makeQuantizeSample(image, w, h);
+
+  const unsigned levels = 4;
+
+  /*The three modes, all with the same levels so they are comparable.*/
+  runQuantizeMode(image, w, h, levels, LQ_NONE, 100, "lut        ");
+  runQuantizeMode(image, w, h, levels, LQ_ORDERED, 100, "ordered    ");
+  runQuantizeMode(image, w, h, levels, LQ_FS, 100, "error-diff ");
+
+  /*Configurable dither strength: a second strength value must be accepted.*/
+  runQuantizeMode(image, w, h, levels, LQ_ORDERED, 25, "ordered-25%");
+  runQuantizeMode(image, w, h, levels, LQ_FS, 50, "fs-50%     ");
+
+  /*Determinism: same parameters must produce a byte-identical result twice.*/
+  {
+    std::vector<unsigned char> a, b;
+    unsigned e1 = lodepng::quantize(a, image, w, h, 4, levels, LQ_ORDERED, 75);
+    unsigned e2 = lodepng::quantize(b, image, w, h, 4, levels, LQ_ORDERED, 75);
+    ASSERT_NO_PNG_ERROR(e1);
+    ASSERT_NO_PNG_ERROR(e2);
+    ASSERT_EQUALS(a.size(), b.size());
+    ASSERT_TRUE(a == b);
+  }
+  {
+    std::vector<unsigned char> a, b;
+    unsigned e1 = lodepng::quantize(a, image, w, h, 4, levels, LQ_FS, 100);
+    unsigned e2 = lodepng::quantize(b, image, w, h, 4, levels, LQ_FS, 100);
+    ASSERT_NO_PNG_ERROR(e1);
+    ASSERT_NO_PNG_ERROR(e2);
+    ASSERT_TRUE(a == b);
+  }
+
+  /*Pure lookup table quantization: output values must all be valid LUT entries,
+  and every channel value must be one of the levels level centers.*/
+  {
+    std::vector<unsigned char> out;
+    LodePNGQuantizeStats stats;
+    unsigned error = lodepng::quantize(out, image, w, h, 4, levels, LQ_NONE,
+                                       100, &stats);
+    size_t i, c;
+    ASSERT_NO_PNG_ERROR(error);
+    for(i = 0; i < out.size() / 4; i++) {
+      for(c = 0; c < 3; c++) {
+        unsigned v = out[i * 4 + c];
+        int valid = 0;
+        unsigned k;
+        for(k = 0; k < levels; k++) {
+          unsigned center = k * 255 / (levels - 1);
+          if(v == center) valid = 1;
+        }
+        ASSERT_TRUE(valid);
+      }
+      /*alpha is copied unchanged*/
+      ASSERT_EQUALS(image[i * 4 + 3], out[i * 4 + 3]);
+    }
+    ASSERT_TRUE(stats.distinct_colors >= 1);
+  }
+
+  /*levels = 256 is the identity mapping, even with dithering enabled.*/
+  {
+    std::vector<unsigned char> out;
+    unsigned e1 = lodepng::quantize(out, image, w, h, 4, 256, LQ_ORDERED, 100);
+    unsigned e2 = lodepng::quantize(out, image, w, h, 4, 256, LQ_FS, 100);
+    ASSERT_NO_PNG_ERROR(e1);
+    ASSERT_NO_PNG_ERROR(e2);
+    ASSERT_TRUE(out == image);
+  }
+
+  /*Ordered dither with strength 0 equals plain lookup table quantization.*/
+  {
+    std::vector<unsigned char> plain, weakened;
+    unsigned e1 = lodepng::quantize(plain, image, w, h, 4, levels, LQ_NONE, 100);
+    unsigned e2 = lodepng::quantize(weakened, image, w, h, 4, levels,
+                                    LQ_ORDERED, 0);
+    ASSERT_NO_PNG_ERROR(e1);
+    ASSERT_NO_PNG_ERROR(e2);
+    ASSERT_TRUE(plain == weakened);
+    /*the same holds for error diffusion with zero strength*/
+    ASSERT_NO_PNG_ERROR(lodepng::quantize(weakened, image, w, h, 4, levels,
+                                          LQ_FS, 0));
+    ASSERT_TRUE(plain == weakened);
+  }
+
+  /*Dithering breaks up flat banding: on this gradient image both dither modes
+  must produce at least as many distinct colors as plain quantization.*/
+  {
+    std::vector<unsigned char> plain, ordered, fs;
+    LodePNGQuantizeStats s0, s1, s2;
+    lodepng::quantize(plain, image, w, h, 4, levels, LQ_NONE, 100, &s0);
+    lodepng::quantize(ordered, image, w, h, 4, levels, LQ_ORDERED, 100, &s1);
+    lodepng::quantize(fs, image, w, h, 4, levels, LQ_FS, 100, &s2);
+    ASSERT_TRUE(s1.distinct_colors >= s0.distinct_colors);
+    ASSERT_TRUE(s2.distinct_colors >= s0.distinct_colors);
+    ASSERT_TRUE(ordered != plain);
+    ASSERT_TRUE(fs != plain);
+  }
+
+  /*Failure paths: illegal levels.*/
+  {
+    std::vector<unsigned char> out;
+    ASSERT_EQUALS(124, lodepng::quantize(out, image, w, h, 4, 0, LQ_NONE, 100));
+    ASSERT_EQUALS(124, lodepng::quantize(out, image, w, h, 4, 1, LQ_NONE, 100));
+    ASSERT_EQUALS(124, lodepng::quantize(out, image, w, h, 4, 257, LQ_NONE, 100));
+  }
+
+  /*Failure paths: illegal dither strength or mode.*/
+  {
+    std::vector<unsigned char> out;
+    ASSERT_EQUALS(125, lodepng::quantize(out, image, w, h, 4, levels,
+                                         LQ_ORDERED, 101));
+    ASSERT_EQUALS(125, lodepng::quantize(out, image, w, h, 4, levels,
+                                         (LodePNGQuantizeMode)9, 100));
+  }
+
+  /*Failure paths: unsupported channel count or bad dimensions.*/
+  {
+    std::vector<unsigned char> out;
+    ASSERT_EQUALS(126, lodepng::quantize(out, image, w, h, 2, levels,
+                                         LQ_NONE, 100));
+    ASSERT_EQUALS(126, lodepng::quantize(out, image, 0, h, 4, levels,
+                                         LQ_NONE, 100));
+    /*buffer size does not match w*h*channels*/
+    ASSERT_EQUALS(126, lodepng::quantize(out, image, w + 1, h, 4, levels,
+                                         LQ_NONE, 100));
+  }
+
+  /*RGB (3 channels) is supported and leaves the output at 3 bytes/pixel.*/
+  {
+    std::vector<unsigned char> rgb((size_t)w * h * 3), out;
+    size_t i;
+    for(i = 0; i < (size_t)w * h; i++) {
+      rgb[i * 3 + 0] = image[i * 4 + 0];
+      rgb[i * 3 + 1] = image[i * 4 + 1];
+      rgb[i * 3 + 2] = image[i * 4 + 2];
+    }
+    ASSERT_NO_PNG_ERROR(lodepng::quantize(out, rgb, w, h, 3, levels,
+                                          LQ_FS, 100));
+    ASSERT_EQUALS(rgb.size(), out.size());
+  }
+}
+
 void doMain() {
   //PNG
   testPngSuite();
@@ -3973,6 +4187,7 @@ void doMain() {
   testColorConvert2();
   testPaletteToPaletteConvert();
   testRGBToPaletteConvert();
+  testQuantize();
   test16bitColorEndianness();
   testAutoColorModels();
   testNoAutoConvert();

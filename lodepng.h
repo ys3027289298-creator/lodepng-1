@@ -132,6 +132,65 @@ typedef enum LodePNGColorType {
   LCT_MAX_OCTET_VALUE = 255
 } LodePNGColorType;
 
+/*Dithering mode used by lodepng_quantize.*/
+typedef enum LodePNGQuantizeMode {
+  /*No dithering: every channel value is reduced purely through the lookup table.*/
+  LQ_NONE = 0,
+  /*Ordered (Bayer 4x4) dithering on top of the lookup table quantization.*/
+  LQ_ORDERED = 1,
+  /*Floyd-Steinberg error diffusion on top of the lookup table quantization.*/
+  LQ_FS = 2
+} LodePNGQuantizeMode;
+
+/*
+Statistics of a lodepng_quantize run. All numbers are computed with integer
+arithmetic and depend only on the input pixels and the parameters, so running
+the function twice with identical arguments gives identical statistics.
+*/
+typedef struct LodePNGQuantizeStats {
+  /*Number of different (packed RGB or RGBA) colors present in the output.*/
+  size_t distinct_colors;
+  /*Size in bytes of the raw output pixel buffer, equal to the input size.*/
+  size_t output_size;
+  /*Sum of absolute per-channel differences between input and output, for the
+  R, G and B channels respectively (alpha is copied unchanged and not measured).*/
+  size_t sad[3];
+  /*Sum of squared per-channel differences between input and output, for the
+  R, G and B channels respectively. Stored in size_t, which is wide enough for
+  images up to at least 65536x65536 pixels.*/
+  size_t ssd[3];
+  /*Mean absolute difference per channel, in 1/1000 units: sad / pixelcount * 1000.*/
+  unsigned mae_milli[3];
+  /*Root mean square error per channel in 1/1000 units, computed with an integer
+  square root: sqrt(ssd / pixelcount) * 1000.*/
+  unsigned rmse_milli[3];
+} LodePNGQuantizeStats;
+
+/*
+Reduces the number of per-channel color levels of an 8-bit raw image using a
+precomputed lookup table, optionally combined with dithering to avoid color
+banding. It works on RGB (channels = 3) or RGBA (channels = 4) images; the
+alpha channel is always copied unchanged.
+
+levels: number of quantization levels per channel, must be between 2 and 256.
+  With levels = 256 every value maps to itself.
+mode: one of LodePNGQuantizeMode.
+dither_strength: strength of the dither as a percentage from 0 to 100. 0 means
+  the dither has no effect (the result is the same as LQ_NONE), 100 is full
+  strength. It is ignored for LQ_NONE.
+
+The output buffer has exactly the same size as the input and the function does
+not allocate on success beyond temporary working storage. Returns 0 on success,
+124 for an illegal levels argument, 125 for an illegal dither_strength or mode,
+126 for an unsupported number of channels or zero/overflowing dimensions, and
+83 if a memory allocation fails.
+*/
+unsigned lodepng_quantize(unsigned char* out, const unsigned char* in,
+                          unsigned w, unsigned h, unsigned channels,
+                          unsigned levels, LodePNGQuantizeMode mode,
+                          unsigned dither_strength,
+                          LodePNGQuantizeStats* stats);
+
 #ifdef LODEPNG_COMPILE_DECODER
 /*
 Converts PNG data in memory to raw pixel data.
@@ -299,6 +358,15 @@ unsigned encode(const std::string& filename,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
 #endif /* LODEPNG_COMPILE_DISK */
 #endif /* LODEPNG_COMPILE_ENCODER */
+
+/*Same as lodepng_quantize, but resizes the std::vector output itself and works
+on an std::vector input with 3 (RGB) or 4 (RGBA) bytes per pixel.*/
+unsigned quantize(std::vector<unsigned char>& out,
+                  const std::vector<unsigned char>& in, unsigned w, unsigned h,
+                  unsigned channels, unsigned levels,
+                  LodePNGQuantizeMode mode = LQ_NONE,
+                  unsigned dither_strength = 100,
+                  LodePNGQuantizeStats* stats = 0);
 } /* namespace lodepng */
 #endif /*LODEPNG_COMPILE_CPP*/
 #endif /*LODEPNG_COMPILE_PNG*/

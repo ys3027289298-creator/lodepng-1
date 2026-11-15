@@ -6918,6 +6918,268 @@ void lodepng_encoder_settings_init(LodePNGEncoderSettings* settings) {
 #endif /*LODEPNG_COMPILE_ENCODER*/
 #endif /*LODEPNG_COMPILE_PNG*/
 
+#ifdef LODEPNG_COMPILE_PNG
+
+/*4x4 Bayer ordered dither matrix, values 0..15. Same pattern as the one used
+in pngdetail.cpp so the result stays consistent with the rest of LodePNG.*/
+static const unsigned char lodepng_bayer4x4[16] = {
+   0,  8,  2, 10,
+  12,  4, 14,  6,
+   3, 11,  1,  9,
+  15,  7, 13,  5
+};
+
+/*Integer square root of a size_t value (Newton's method would need a wider
+type on 32 bit, so a simple bit scan is used instead).*/
+static size_t lodepng_isqrt(size_t value) {
+  size_t root = 0;
+  size_t bit = (size_t)1 << (sizeof(size_t) * 8 - 2);
+  while(bit > value) bit >>= 2;
+  while(bit != 0) {
+    if(value >= root + bit) {
+      value -= root + bit;
+      root = (root >> 1) + bit;
+    } else {
+      root >>= 1;
+    }
+    bit >>= 2;
+  }
+  return root;
+}
+
+/*Open addressing hash set used to count the distinct packed output colors.
+Empty slots contain LODEPNG_QUANT_EMPTY; packed colors can never be 0 because
+1 is added to each packed key.*/
+#define LODEPNG_QUANT_EMPTY 0
+
+typedef struct LodePNGColorSet {
+  size_t* keys;
+  size_t capacity; /*always a power of two*/
+  size_t count;
+} LodePNGColorSet;
+
+static void lodepng_colorset_cleanup(LodePNGColorSet* set) {
+  lodepng_free(set->keys);
+  set->keys = 0;
+  set->capacity = 0;
+  set->count = 0;
+}
+
+static int lodepng_colorset_init(LodePNGColorSet* set, size_t capacity) {
+  size_t i;
+  set->count = 0;
+  set->capacity = capacity;
+  set->keys = (size_t*)lodepng_malloc(capacity * sizeof(size_t));
+  if(!set->keys) {
+    set->capacity = 0;
+    return 83;
+  }
+  for(i = 0; i < capacity; i++) set->keys[i] = LODEPNG_QUANT_EMPTY;
+  return 0;
+}
+
+/*Returns 1 if the key was newly inserted, 0 if it was already present.*/
+static int lodepng_colorset_add(LodePNGColorSet* set, size_t key) {
+  size_t packed = key + 1; /*0 is reserved for empty slots*/
+  size_t mask = set->capacity - 1;
+  size_t pos;
+  /*Fibonacci-style mixing, split into two multiplies so no constant wider than
+  32 bits is needed (keeps the code C90/C++98 clean).*/
+  size_t mixed = packed * 2654435761u;
+  mixed ^= packed * 40503u;
+  pos = mixed & mask;
+  while(set->keys[pos] != LODEPNG_QUANT_EMPTY) {
+    if(set->keys[pos] == packed) return 0;
+    pos = (pos + 1) & mask;
+  }
+  set->keys[pos] = packed;
+  set->count++;
+  return 1;
+}
+
+static size_t lodepng_pack_color(const unsigned char* pixel, unsigned channels) {
+  size_t packed = (size_t)pixel[0];
+  packed = (packed << 8) | pixel[1];
+  packed = (packed << 8) | pixel[2];
+  if(channels == 4) packed = (packed << 8) | pixel[3];
+  return packed;
+}
+
+static void lodepng_quantize_stats_finish(LodePNGQuantizeStats* stats,
+                                          size_t pixelcount) {
+  unsigned c;
+  if(!stats || pixelcount == 0) return;
+  for(c = 0; c < 3; c++) {
+    /*millithing rounding: (value * 1000 + pixelcount/2) / pixelcount*/
+    stats->mae_milli[c] = (unsigned)((stats->sad[c] * 1000 + pixelcount / 2)
+                                     / pixelcount);
+    stats->rmse_milli[c] = (unsigned)(lodepng_isqrt(stats->ssd[c] / pixelcount)
+                                      * 1000);
+  }
+}
+
+unsigned lodepng_quantize(unsigned char* out, const unsigned char* in,
+                          unsigned w, unsigned h, unsigned channels,
+                          unsigned levels, LodePNGQuantizeMode mode,
+                          unsigned dither_strength,
+                          LodePNGQuantizeStats* stats) {
+  unsigned char lut[256];
+  size_t pixelcount, rawsize, i, p, c;
+  int* errrow[2]; /*Floyd-Steinberg error rows, values in 1/16 units*/
+  LodePNGColorSet colorset;
+  unsigned set_error;
+  size_t hash_capacity;
+
+  if(stats) {
+    stats->distinct_colors = 0;
+    stats->output_size = 0;
+    for(c = 0; c < 3; c++) {
+      stats->sad[c] = 0;
+      stats->ssd[c] = 0;
+      stats->mae_milli[c] = 0;
+      stats->rmse_milli[c] = 0;
+    }
+  }
+
+  if(w == 0 || h == 0 || (channels != 3 && channels != 4)) return 126;
+  if(levels < 2 || levels > 256) return 124;
+  if(dither_strength > 100) return 125;
+  if(mode != LQ_NONE && mode != LQ_ORDERED && mode != LQ_FS) return 125;
+  if(!in || !out) return 126;
+
+  pixelcount = (size_t)w * (size_t)h;
+  if(pixelcount / (size_t)w != (size_t)h) return 126;
+  rawsize = pixelcount * (size_t)channels;
+  if(rawsize / (size_t)channels != pixelcount) return 126;
+
+  /*Build the per-channel lookup table. Level i is centered at
+  i * 255 / (levels - 1); each input value maps to the nearest level.*/
+  for(i = 0; i < 256; i++) {
+    unsigned scaled = (unsigned)(i * (levels - 1));
+    unsigned nearest = (scaled + 127) / 255;
+    if(nearest >= levels) nearest = levels - 1;
+    lut[i] = (unsigned char)(nearest * 255 / (levels - 1));
+  }
+
+  errrow[0] = 0;
+  errrow[1] = 0;
+  colorset.keys = 0;
+  colorset.capacity = 0;
+  colorset.count = 0;
+
+  if(mode == LQ_FS) {
+    size_t rowbytes = (size_t)w * 3 * sizeof(int);
+    errrow[0] = (int*)lodepng_malloc(rowbytes);
+    errrow[1] = (int*)lodepng_malloc(rowbytes);
+    if(!errrow[0] || !errrow[1]) {
+      lodepng_free(errrow[0]);
+      lodepng_free(errrow[1]);
+      return 83;
+    }
+    for(i = 0; i < (size_t)w * 3; i++) {
+      errrow[0][i] = 0;
+      errrow[1][i] = 0;
+    }
+  }
+
+  /*The hash table only needs to hold as many colors as there are pixels; round
+  up to a power of two and keep a load factor below 0.5.*/
+  hash_capacity = 16;
+  while(hash_capacity < pixelcount * 2) {
+    if(hash_capacity >= ((size_t)1 << (sizeof(size_t) * 8 - 2))) {
+      lodepng_free(errrow[0]);
+      lodepng_free(errrow[1]);
+      return 83;
+    }
+    hash_capacity <<= 1;
+  }
+  set_error = (unsigned)lodepng_colorset_init(&colorset, hash_capacity);
+  if(set_error) {
+    lodepng_free(errrow[0]);
+    lodepng_free(errrow[1]);
+    return (unsigned)set_error;
+  }
+
+  for(p = 0; p < pixelcount; p++) {
+    unsigned x = (unsigned)(p % w);
+    unsigned y = (unsigned)(p / w);
+    const unsigned char* inpix = in + p * channels;
+    unsigned char* outpix = out + p * channels;
+    size_t packed;
+
+    for(c = 0; c < 3; c++) {
+      int original = inpix[c];
+      int value = original;
+      int adjusted, quantized, diff;
+
+      if(mode == LQ_ORDERED && dither_strength > 0) {
+        unsigned threshold = lodepng_bayer4x4[(x & 3) + 4 * (y & 3)]; /*0..15*/
+        /*bias range at full strength is +/- half the bucket width*/
+        unsigned half_width = (255 + (levels - 1)) / (2 * (levels - 1));
+        int centered = (int)threshold - 7; /*-7..8, close to -7.5..7.5*/
+        int bias = centered * (int)half_width * (int)dither_strength / (8 * 100);
+        adjusted = value + bias;
+        if(adjusted < 0) adjusted = 0;
+        if(adjusted > 255) adjusted = 255;
+        quantized = lut[adjusted];
+      } else if(mode == LQ_FS) {
+        int carried = errrow[0][x * 3 + c] / 16;
+        adjusted = value + carried;
+        if(adjusted < 0) adjusted = 0;
+        if(adjusted > 255) adjusted = 255;
+        quantized = lut[adjusted];
+        /*diff is the quantization error in value units, attenuated by the
+        dither strength percentage, then stored scaled by 16. At strength 0 no
+        error is propagated so the result matches plain LUT quantization.*/
+        diff = (adjusted - quantized) * (int)dither_strength / 100;
+        errrow[0][x * 3 + c] = 0;
+        /*Floyd-Steinberg weights: right 7, below-left 3, below 5, below-right 1*/
+        if(x + 1 < w) errrow[0][(x + 1) * 3 + c] += diff * 7;
+        errrow[1][x * 3 + c] += diff * 5;
+        if(x > 0) errrow[1][(x - 1) * 3 + c] += diff * 3;
+        if(x + 1 < w) errrow[1][(x + 1) * 3 + c] += diff;
+      } else {
+        quantized = lut[value];
+      }
+
+      outpix[c] = (unsigned char)quantized;
+
+      if(stats) {
+        int adiff = quantized - original;
+        if(adiff < 0) adiff = -adiff;
+        stats->sad[c] += (size_t)adiff;
+        stats->ssd[c] += (size_t)adiff * (size_t)adiff;
+      }
+    }
+
+    if(channels == 4) outpix[3] = inpix[3];
+
+    packed = lodepng_pack_color(outpix, channels);
+    lodepng_colorset_add(&colorset, packed);
+
+    /*swap error rows at the end of each scanline*/
+    if(mode == LQ_FS && x == w - 1) {
+      int* tmp = errrow[0];
+      errrow[0] = errrow[1];
+      errrow[1] = tmp;
+      for(i = 0; i < (size_t)w * 3; i++) errrow[1][i] = 0;
+    }
+  }
+
+  if(stats) {
+    stats->distinct_colors = colorset.count;
+    stats->output_size = rawsize;
+    lodepng_quantize_stats_finish(stats, pixelcount);
+  }
+
+  lodepng_colorset_cleanup(&colorset);
+  lodepng_free(errrow[0]);
+  lodepng_free(errrow[1]);
+  return 0;
+}
+
+#endif /*LODEPNG_COMPILE_PNG*/
+
 #ifdef LODEPNG_COMPILE_ERROR_TEXT
 /*
 This returns the description of a numerical error code in English. This is also
@@ -7055,6 +7317,9 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "invalid quantize levels: must be between 2 and 256";
+    case 125: return "invalid quantize dither mode or dither strength (strength must be 0-100)";
+    case 126: return "invalid quantize image: width/height zero, unsupported channel count, or size overflow";
   }
   return "unknown error code";
 }
@@ -7268,6 +7533,19 @@ unsigned encode(const std::string& filename,
 }
 #endif /* LODEPNG_COMPILE_DISK */
 #endif /* LODEPNG_COMPILE_ENCODER */
+
+unsigned quantize(std::vector<unsigned char>& out,
+                  const std::vector<unsigned char>& in, unsigned w, unsigned h,
+                  unsigned channels, unsigned levels,
+                  LodePNGQuantizeMode mode, unsigned dither_strength,
+                  LodePNGQuantizeStats* stats) {
+  size_t expected = (size_t)w * (size_t)h * (size_t)channels;
+  if(expected != in.size()) return 126;
+  out.resize(expected);
+  if(expected == 0) return 126;
+  return lodepng_quantize(&out[0], &in[0], w, h, channels, levels, mode,
+                          dither_strength, stats);
+}
 #endif /* LODEPNG_COMPILE_PNG */
 } /* namespace lodepng */
 #endif /*LODEPNG_COMPILE_CPP*/
