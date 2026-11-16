@@ -5529,10 +5529,21 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
   lodepng_free(scanlines);
 }
 
+static unsigned lodepng_tiff_decode(unsigned char** out, unsigned* w, unsigned* h,
+                                    LodePNGColorType colortype, unsigned bitdepth,
+                                    const unsigned char* in, size_t insize);
+static int lodepng_is_tiff(const unsigned char* in, size_t insize);
+
 unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
                         LodePNGState* state,
                         const unsigned char* in, size_t insize) {
   *out = 0;
+  /*TIFF input is detected by its byte order mark and handled by the TIFF
+  reader; the PNG path below is unchanged for everything else*/
+  if(lodepng_is_tiff(in, insize)) {
+    return lodepng_tiff_decode(out, w, h, state->info_raw.colortype,
+                               state->info_raw.bitdepth, in, insize);
+  }
   decodeGeneric(out, w, h, state, in, insize);
   if(state->error) goto cleanup;
   if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
@@ -5635,6 +5646,832 @@ void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
   settings->ignore_critical = 0;
   settings->ignore_end = 0;
   lodepng_decompress_settings_init(&settings->zlibsettings);
+}
+
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / TIFF Decoder                                                            / */
+/* ////////////////////////////////////////////////////////////////////////// */
+/*
+Minimal baseline-TIFF (TIFF 6.0) reader, reachable through the same public
+decode entry points as PNG: a buffer beginning with the II*\0 or MM\0* TIFF
+byte order mark is routed here instead of the PNG parser, so the public API
+signatures do not change.
+
+Supported: one unsigned integer sample per channel, 1/2/4/8/16 bits per
+sample, photometric interpretations MinIsBlack, MinIsWhite, RGB and palette,
+chunky (PlanarConfiguration 1) and planar (2) layouts, tiled or stripped image
+data, and compression 1 (none), 5 (LZW) and 8/32946 (zlib/deflate). Only the
+first image (first IFD) of a multi-page document is decoded. Everything else
+results in one of the explicit TIFF error codes (128-136).
+*/
+
+/* TIFF tags that are interpreted */
+#define LODEPNG_TIFF_TAG_IMAGEWIDTH      256
+#define LODEPNG_TIFF_TAG_IMAGELENGTH     257
+#define LODEPNG_TIFF_TAG_BITSPERSAMPLE   258
+#define LODEPNG_TIFF_TAG_COMPRESSION     259
+#define LODEPNG_TIFF_TAG_PHOTOMETRIC     262
+#define LODEPNG_TIFF_TAG_STRIPOFFSETS    273
+#define LODEPNG_TIFF_TAG_SAMPLESPERPIXEL 277
+#define LODEPNG_TIFF_TAG_ROWSPERSTRIP    278
+#define LODEPNG_TIFF_TAG_STRIPBYTECOUNTS 279
+#define LODEPNG_TIFF_TAG_PLANARCONFIG    284
+#define LODEPNG_TIFF_TAG_COLORMAP        320
+#define LODEPNG_TIFF_TAG_TILEWIDTH       322
+#define LODEPNG_TIFF_TAG_TILELENGTH      323
+#define LODEPNG_TIFF_TAG_TILEOFFSETS     324
+#define LODEPNG_TIFF_TAG_TILEBYTECOUNTS  325
+#define LODEPNG_TIFF_TAG_SAMPLEFORMAT    339
+#define LODEPNG_TIFF_TAG_FILLORDER       266
+
+typedef struct LodePNGTiffTag {
+  unsigned short tag;
+  unsigned short type;
+  size_t count;
+  int is_offset; /*value/values stored outside the 4 entry bytes*/
+  unsigned long inline_value; /*the 4 entry bytes interpreted as one value*/
+  const unsigned char* values; /*points at count values, inline or inside file*/
+} LodePNGTiffTag;
+
+typedef struct LodePNGTiffIFD {
+  LodePNGTiffTag* tags;
+  size_t num_tags;
+  unsigned long next_ifd;
+} LodePNGTiffIFD;
+
+typedef struct LodePNGTiffState {
+  const unsigned char* data;
+  size_t size;
+  int little_endian; /*1 for II (Intel), 0 for MM (Motorola)*/
+  LodePNGTiffIFD ifd;
+} LodePNGTiffState;
+
+/*bounds checked readers, return 0 on success*/
+static int tiff_read16(const LodePNGTiffState* tiff, size_t pos, unsigned short* value) {
+  unsigned short result;
+  if(pos + 2 > tiff->size) return 1;
+  if(tiff->little_endian) {
+    result = (unsigned short)(tiff->data[pos] | (tiff->data[pos + 1] << 8));
+  } else {
+    result = (unsigned short)((tiff->data[pos] << 8) | tiff->data[pos + 1]);
+  }
+  *value = result;
+  return 0;
+}
+
+static int tiff_read32(const LodePNGTiffState* tiff, size_t pos, unsigned long* value) {
+  unsigned long result;
+  if(pos + 4 > tiff->size) return 1;
+  if(tiff->little_endian) {
+    result = (unsigned long)tiff->data[pos]
+           | ((unsigned long)tiff->data[pos + 1] << 8)
+           | ((unsigned long)tiff->data[pos + 2] << 16)
+           | ((unsigned long)tiff->data[pos + 3] << 24);
+  } else {
+    result = ((unsigned long)tiff->data[pos] << 24)
+           | ((unsigned long)tiff->data[pos + 1] << 16)
+           | ((unsigned long)tiff->data[pos + 2] << 8)
+           | (unsigned long)tiff->data[pos + 3];
+  }
+  *value = result;
+  return 0;
+}
+
+/*size in bytes of one TIFF field type*/
+static size_t tiff_type_size(unsigned short type) {
+  switch(type) {
+    case 1: case 2: case 6: case 7: return 1; /*BYTE, ASCII, SBYTE, UNDEFINED*/
+    case 3: case 8: return 2; /*SHORT, SSHORT*/
+    case 4: case 9: case 11: return 4; /*LONG, SLONG, FLOAT*/
+    case 5: case 10: case 12: return 8; /*RATIONAL, SRATIONAL, DOUBLE*/
+    default: return 0; /*unknown type*/
+  }
+}
+
+/*read one field value of the tag's type at index i, returns 0 on success*/
+static int tiff_tag_value(const LodePNGTiffState* tiff, const LodePNGTiffTag* tag,
+                          size_t i, unsigned long* value) {
+  size_t base, pos, unit;
+  if(i >= tag->count) return 1;
+  unit = tiff_type_size(tag->type);
+  if(unit == 0) return 1;
+  base = (size_t)(tag->values - tiff->data);
+  if(tag->is_offset) {
+    /*an external value array: each element is unit bytes, packed*/
+    pos = base + i * unit;
+  } else {
+    /*inline: the value field is 4 bytes left-justified, so every element
+    starts at the field's first byte regardless of its own size*/
+    pos = base;
+  }
+  if(pos + unit > tiff->size) return 1;
+  if(tag->type == 3 || tag->type == 8) {
+    unsigned short v16;
+    if(tiff_read16(tiff, pos, &v16)) return 1;
+    *value = (unsigned long)v16;
+  } else if(unit == 1) {
+    *value = (unsigned long)tiff->data[pos];
+  } else {
+    if(tiff_read32(tiff, pos, value)) return 1;
+  }
+  return 0;
+}
+
+static const LodePNGTiffTag* tiff_find_tag(const LodePNGTiffIFD* ifd, unsigned short tag) {
+  size_t i;
+  for(i = 0; i < ifd->num_tags; i++) {
+    if(ifd->tags[i].tag == tag) return &ifd->tags[i];
+  }
+  return 0;
+}
+
+static unsigned tiff_parse_ifd(LodePNGTiffState* tiff, unsigned long offset) {
+  unsigned short num_entries, i;
+  size_t pos;
+  LodePNGTiffIFD* ifd = &tiff->ifd;
+
+  ifd->tags = 0;
+  ifd->num_tags = 0;
+  ifd->next_ifd = 0;
+
+  if(tiff_read16(tiff, (size_t)offset, &num_entries)) return 129;
+  ifd->num_tags = num_entries;
+  if(num_entries == 0) return 129;
+  ifd->tags = (LodePNGTiffTag*)lodepng_malloc((size_t)num_entries * sizeof(LodePNGTiffTag));
+  if(!ifd->tags) return 83;
+
+  for(i = 0; i < num_entries; i++) {
+    LodePNGTiffTag* entry = &ifd->tags[i];
+    unsigned short type;
+    size_t unit, total;
+    unsigned long count, value_offset;
+
+    pos = (size_t)offset + 2 + (size_t)i * 12;
+    if(tiff_read16(tiff, pos, &entry->tag) || tiff_read16(tiff, pos + 2, &type)
+       || tiff_read32(tiff, pos + 4, &count)) {
+      return 129;
+    }
+    entry->type = type;
+    entry->count = (size_t)count;
+    unit = tiff_type_size(type);
+    if(unit == 0) return 133; /*unknown field type*/
+    if(lodepng_mulofl((size_t)count, unit, &total)) return 77;
+    if(total > 4) {
+      if(tiff_read32(tiff, pos + 8, &value_offset)) return 129;
+      if((size_t)value_offset + total < (size_t)value_offset
+         || (size_t)value_offset + total > tiff->size) return 129;
+      entry->is_offset = 1;
+      entry->inline_value = value_offset;
+      entry->values = tiff->data + (size_t)value_offset;
+    } else {
+      entry->is_offset = 0;
+      if(tiff_read32(tiff, pos + 8, &entry->inline_value)) return 129;
+      /*the value bytes start at the beginning of the 4 value/offset bytes*/
+      entry->values = tiff->data + pos + 8;
+    }
+  }
+
+  pos = (size_t)offset + 2 + (size_t)num_entries * 12;
+  if(tiff_read32(tiff, pos, &ifd->next_ifd)) return 129;
+  return 0;
+}
+
+/*LZW decompression as used by TIFF compression 5. Writes into a ucvector.*/
+static unsigned tiff_lzw_decode(ucvector* out, const unsigned char* in, size_t insize) {
+  /*at most 4096 table entries; each phrase is a prefix code plus one suffix
+  byte, so the full phrase is reconstructed by walking the prefix chain*/
+  unsigned short prefix[4096];
+  unsigned char suffix[4096];
+  unsigned short code, old_code = 0;
+  unsigned code_size, next_code, clear_code, eoi_code;
+  size_t bit_pos = 0; /*position in input, in bits*/
+  size_t stack_pos;
+  unsigned char stack[4096];
+  int have_old = 0;
+  int kwkwk;            /*current code is the not-yet-defined KwKwK case*/
+  unsigned char first;  /*first character of the currently emitted string*/
+
+  clear_code = 256;
+  eoi_code = 257;
+  code_size = 9;
+  next_code = 258;
+
+  for(;;) {
+    unsigned long bits = 0;
+    size_t j;
+    unsigned short entry;
+
+    /*read code_size bits, MSB-first within each byte as TIFF requires*/
+    if(bit_pos + (size_t)code_size > insize * 8) return 132; /*truncated LZW stream*/
+    for(j = 0; j < code_size; j++) {
+      size_t byte_index = (bit_pos + j) / 8;
+      size_t bit_index = 7 - ((bit_pos + j) % 8);
+      bits |= ((unsigned long)((in[byte_index] >> bit_index) & 1)) << (code_size - 1 - j);
+    }
+    bit_pos += code_size;
+    code = (unsigned short)bits;
+
+    if(code == clear_code) {
+      code_size = 9;
+      next_code = 258;
+      have_old = 0;
+      continue;
+    }
+    if(code == eoi_code) break;
+
+    if(!have_old) {
+      /*first code after a clear must be a literal*/
+      if(code >= 256) return 132;
+      if(!ucvector_resize(out, out->size + 1)) return 83;
+      out->data[out->size - 1] = (unsigned char)code;
+      old_code = code;
+      have_old = 1;
+      continue;
+    }
+
+    kwkwk = 0;
+    if(code < next_code) {
+      entry = code;
+    } else if(code == next_code) {
+      /*KwKwK: phrase = old phrase followed by its own first character*/
+      entry = old_code;
+      kwkwk = 1;
+    } else {
+      return 132; /*code not yet in table*/
+    }
+
+    /*walk the prefix chain onto a stack; the deepest element is the phrase's
+    first character, which is also what a new dictionary entry appends*/
+    stack_pos = 0;
+    {
+      unsigned short cur = entry;
+      while(cur >= 258) {
+        if(stack_pos >= 4096) return 132;
+        stack[stack_pos++] = suffix[cur];
+        cur = prefix[cur];
+      }
+      if(stack_pos >= 4096) return 132;
+      stack[stack_pos++] = (unsigned char)cur;
+    }
+    /*after the walk, stack[stack_pos-1] holds the first character*/
+    first = stack[stack_pos - 1];
+
+    /*define the new phrase (old phrase + first char of this phrase) before
+    emitting, matching the TIFF early-change code-width convention*/
+    if(next_code < 4096) {
+      prefix[next_code] = old_code;
+      suffix[next_code] = first;
+      next_code++;
+      /*TIFF LZW early change: the reader widens at 511/1023/2047, one code
+      before the 512/1024/2048 boundary*/
+      if(next_code == 511 || next_code == 1023 || next_code == 2047) {
+        if(next_code < 4096) code_size++;
+      }
+    }
+
+    /*emit the resolved phrase; for KwKwK add the repeated first character at
+    the end of the phrase (top of the reversed stack is emitted last)*/
+    if(kwkwk) {
+      if(stack_pos >= 4096) return 132;
+      stack[stack_pos++] = first;
+    }
+    while(stack_pos > 0) {
+      if(!ucvector_resize(out, out->size + 1)) return 83;
+      out->data[out->size - 1] = stack[--stack_pos];
+    }
+    old_code = code;
+  }
+  return 0;
+}
+
+/*number of bytes a (sub-byte unpacked) scanline occupies, padded to a byte*/
+static size_t tiff_scanline_bytes(unsigned width, unsigned samples, unsigned bps) {
+  size_t bits;
+  if(lodepng_mulofl((size_t)width, (size_t)samples, &bits)) return 0;
+  if(bits > (size_t)-1 / (size_t)bps) return 0;
+  bits *= bps;
+  return (bits + 7) / 8;
+}
+
+/*extract a single sub-byte sample (bps 1, 2 or 4) at the given sample index
+from a packed scanline fragment. fill_order 1 is MSB-first (TIFF default),
+2 is LSB-first.*/
+static unsigned char tiff_unpack_one(const unsigned char* src, size_t index,
+                                     unsigned bps, int fill_order) {
+  unsigned mask = (unsigned)((1 << bps) - 1);
+  size_t bit_pos = index * bps;
+  size_t byte_index = bit_pos / 8;
+  unsigned bit_offset = (unsigned)(bit_pos % 8);
+  if(fill_order == 2) {
+    return (unsigned char)((src[byte_index] >> bit_offset) & mask);
+  }
+  return (unsigned char)((src[byte_index] >> (8 - bit_offset - bps)) & mask);
+}
+
+/*invert grayscale samples for PhotometricInterpretation MinIsWhite (0 = white)*/
+static void tiff_invert_samples(unsigned char* buf, size_t num_samples, unsigned bps) {
+  if(bps < 8) {
+    size_t i;
+    unsigned maxv = (1u << bps) - 1;
+    for(i = 0; i < num_samples; i++) buf[i] = (unsigned char)(maxv - buf[i]);
+  } else if(bps == 8) {
+    size_t i;
+    for(i = 0; i < num_samples; i++) buf[i] = (unsigned char)(255 - buf[i]);
+  } else {
+    size_t i;
+    /*16-bit big endian storage used by the PNG color modes*/
+    for(i = 0; i < num_samples; i++) {
+      unsigned v = ((unsigned)buf[i * 2] << 8) | buf[i * 2 + 1];
+      v = 65535u - v;
+      buf[i * 2] = (unsigned char)(v >> 8);
+      buf[i * 2 + 1] = (unsigned char)(v & 255);
+    }
+  }
+}
+
+/*decode one compressed chunk (strip or tile) into raw bytes*/
+static unsigned tiff_decode_chunk(ucvector* raw, const unsigned char* chunk, size_t chunk_size,
+                                  unsigned short compression) {
+  if(compression == 1) {
+    if(!ucvector_resize(raw, raw->size + chunk_size)) return 83;
+    lodepng_memcpy(raw->data + raw->size - chunk_size, chunk, chunk_size);
+    return 0;
+  } else if(compression == 5) {
+    return tiff_lzw_decode(raw, chunk, chunk_size);
+  } else if(compression == 8 || compression == 32946) {
+    /*Adobe Deflate uses a zlib stream; some writers store raw deflate, try
+    that as fallback when the zlib header is rejected*/
+#ifdef LODEPNG_COMPILE_ZLIB
+    LodePNGDecompressSettings settings;
+    unsigned error;
+    unsigned char* tmp = 0;
+    size_t tmp_size = 0;
+    lodepng_decompress_settings_init(&settings);
+    error = lodepng_zlib_decompress(&tmp, &tmp_size, chunk, chunk_size, &settings);
+    if(error) {
+      lodepng_free(tmp);
+      tmp = 0;
+      tmp_size = 0;
+      if(chunk_size >= 1 && (chunk[0] & 0x0f) != 8) {
+        error = lodepng_inflate(&tmp, &tmp_size, chunk, chunk_size, &settings);
+      }
+    }
+    if(!error) {
+      /*ucvector_resize performs the multiplication/addition overflow checks*/
+      if(!ucvector_resize(raw, raw->size + tmp_size)) {
+        lodepng_free(tmp);
+        return 83;
+      }
+      lodepng_memcpy(raw->data + raw->size - tmp_size, tmp, tmp_size);
+    }
+    lodepng_free(tmp);
+    return error;
+#else
+    return 133; /*deflate support compiled out*/
+#endif
+  }
+  return 133;
+}
+
+static unsigned lodepng_tiff_decode(unsigned char** out, unsigned* w, unsigned* h,
+                                    LodePNGColorType colortype, unsigned bitdepth,
+                                    const unsigned char* in, size_t insize) {
+  LodePNGTiffState tiff;
+  unsigned error = 0;
+  unsigned long bo_marker, ifd_offset;
+  const LodePNGTiffTag *tag_width, *tag_height, *tag_bps, *tag_compression, *tag_photometric;
+  const LodePNGTiffTag *tag_offsets = 0, *tag_counts = 0, *tag_samples, *tag_rowsperstrip;
+  const LodePNGTiffTag *tag_planar, *tag_colormap, *tag_sampleformat, *tag_fillorder;
+  const LodePNGTiffTag *tag_tilewidth, *tag_tilelength, *tag_tileoffsets, *tag_tilecounts;
+  unsigned long width_l, height_l, samples_l, compression_l, photometric_l, planar_l;
+  unsigned width, height, samples_per_pixel, bps, compression, photometric, planar_config;
+  unsigned short fill_order = 1;
+  LodePNGColorMode mode_in;
+  LodePNGColorMode mode_out;
+  unsigned char* decoded = 0; /*uncompressed, packed TIFF sample bytes*/
+  size_t decoded_size = 0;
+  unsigned char* pixels = 0; /*pixels normalized to PNG raw layout*/
+  size_t pixels_size;
+  size_t out_row_bytes;
+  size_t plane_row_bytes, plane_chunk_bytes, chunks_per_plane;
+  size_t i, y, chunk_index, num_chunks;
+  int tiled;
+  unsigned tile_w = 0, tile_h = 0;
+
+  *out = 0;
+  *w = *h = 0;
+
+  if(insize < 8) return 129;
+  if(in[0] == 'I' && in[1] == 'I') {
+    tiff.little_endian = 1;
+  } else if(in[0] == 'M' && in[1] == 'M') {
+    tiff.little_endian = 0;
+  } else {
+    return 128;
+  }
+  tiff.data = in;
+  tiff.size = insize;
+
+  if(tiff_read16(&tiff, 2, (unsigned short*)&bo_marker)) return 129;
+  if(bo_marker != 42) return 128; /*not a TIFF file*/
+  if(tiff_read32(&tiff, 4, &ifd_offset)) return 129;
+  if(ifd_offset == 0 || (size_t)ifd_offset >= insize) return 129;
+
+  error = tiff_parse_ifd(&tiff, ifd_offset);
+  if(error) goto cleanup;
+
+  tag_width = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_IMAGEWIDTH);
+  tag_height = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_IMAGELENGTH);
+  tag_bps = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_BITSPERSAMPLE);
+  tag_compression = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_COMPRESSION);
+  tag_photometric = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_PHOTOMETRIC);
+  tag_samples = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_SAMPLESPERPIXEL);
+  tag_planar = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_PLANARCONFIG);
+  tag_colormap = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_COLORMAP);
+  tag_sampleformat = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_SAMPLEFORMAT);
+  tag_fillorder = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_FILLORDER);
+  tag_tilewidth = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_TILEWIDTH);
+  tag_tilelength = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_TILELENGTH);
+  tag_tileoffsets = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_TILEOFFSETS);
+  tag_tilecounts = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_TILEBYTECOUNTS);
+
+  if(!tag_width || !tag_height || !tag_bps || !tag_compression || !tag_photometric) {
+    error = 130;
+    goto cleanup;
+  }
+
+  if(tiff_tag_value(&tiff, tag_width, 0, &width_l)
+     || tiff_tag_value(&tiff, tag_height, 0, &height_l)) {
+    error = 129;
+    goto cleanup;
+  }
+  if(width_l == 0 || height_l == 0 || width_l > 0xffffffffu || height_l > 0xffffffffu) {
+    error = 130;
+    goto cleanup;
+  }
+  width = (unsigned)width_l;
+  height = (unsigned)height_l;
+
+  if(tiff_tag_value(&tiff, tag_compression, 0, &compression_l)) { error = 129; goto cleanup; }
+  compression = (unsigned)compression_l;
+  if(compression != 1 && compression != 5 && compression != 8 && compression != 32946) {
+    error = 133;
+    goto cleanup;
+  }
+
+  if(tiff_tag_value(&tiff, tag_photometric, 0, &photometric_l)) { error = 129; goto cleanup; }
+  photometric = (unsigned)photometric_l;
+  /*0=MinIsWhite, 1=MinIsBlack, 2=RGB, 3=palette*/
+  if(photometric > 3) { error = 134; goto cleanup; }
+
+  samples_l = 1;
+  if(tag_samples) {
+    if(tiff_tag_value(&tiff, tag_samples, 0, &samples_l)) { error = 129; goto cleanup; }
+  }
+  samples_per_pixel = (unsigned)samples_l;
+  if(samples_per_pixel == 0 || samples_per_pixel > 4) { error = 134; goto cleanup; }
+
+  planar_l = 1;
+  if(tag_planar) {
+    if(tiff_tag_value(&tiff, tag_planar, 0, &planar_l)) { error = 129; goto cleanup; }
+  }
+  planar_config = (unsigned)planar_l;
+  if(planar_config != 1 && planar_config != 2) { error = 134; goto cleanup; }
+  if(planar_config == 2 && samples_per_pixel < 2) { error = 134; goto cleanup; }
+
+  if(tag_fillorder) {
+    unsigned long fo;
+    if(tiff_tag_value(&tiff, tag_fillorder, 0, &fo)) { error = 129; goto cleanup; }
+    if(fo != 1 && fo != 2) { error = 134; goto cleanup; }
+    fill_order = (unsigned short)fo;
+  }
+
+  /*all samples must use the same bit depth and an unsigned integer format*/
+  bps = 0;
+  for(i = 0; i < tag_bps->count; i++) {
+    unsigned long v;
+    if(tiff_tag_value(&tiff, tag_bps, i, &v)) { error = 129; goto cleanup; }
+    if(v != 1 && v != 2 && v != 4 && v != 8 && v != 16) { error = 134; goto cleanup; }
+    if(i == 0) bps = (unsigned)v;
+    else if((unsigned)v != bps) { error = 134; goto cleanup; }
+  }
+  if(tag_sampleformat) {
+    unsigned long sf;
+    if(tiff_tag_value(&tiff, tag_sampleformat, 0, &sf)) { error = 129; goto cleanup; }
+    if(sf != 1) { error = 134; goto cleanup; } /*only unsigned integer samples*/
+  }
+
+  /*consistency of photometric interpretation vs. channel count.
+  Photometric RGB (2) allows 3 samples (RGB) or 4 (RGBA, extra sample);
+  grayscale interpretations and palette require exactly one sample.*/
+  if(photometric == 2 && (samples_per_pixel != 3 && samples_per_pixel != 4)) {
+    error = 134;
+    goto cleanup;
+  }
+  if(photometric == 3) {
+    if(samples_per_pixel != 1 || !tag_colormap) { error = 134; goto cleanup; }
+    if(bps > 8) { error = 134; goto cleanup; }
+  }
+  if((photometric == 0 || photometric == 1) && samples_per_pixel != 1) {
+    error = 134;
+    goto cleanup;
+  }
+
+  tiled = (tag_tilewidth && tag_tilelength && tag_tileoffsets && tag_tilecounts);
+  if(tiled) {
+    unsigned long tw, tl;
+    if(tiff_tag_value(&tiff, tag_tilewidth, 0, &tw)
+       || tiff_tag_value(&tiff, tag_tilelength, 0, &tl)) { error = 129; goto cleanup; }
+    if(tw == 0 || tl == 0) { error = 130; goto cleanup; }
+    tile_w = (unsigned)tw;
+    tile_h = (unsigned)tl;
+  } else {
+    tag_offsets = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_STRIPOFFSETS);
+    tag_counts = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_STRIPBYTECOUNTS);
+    if(!tag_offsets || !tag_counts) { error = 130; goto cleanup; }
+    tag_rowsperstrip = tiff_find_tag(&tiff.ifd, LODEPNG_TIFF_TAG_ROWSPERSTRIP);
+    if(tag_rowsperstrip) {
+      unsigned long rps;
+      if(tiff_tag_value(&tiff, tag_rowsperstrip, 0, &rps)) { error = 129; goto cleanup; }
+      if(rps == 0) rps = height;
+      tile_h = (unsigned)rps;
+    } else {
+      tile_h = height;
+    }
+    tile_w = width;
+  }
+
+  /*decode all chunks into one contiguous packed buffer*/
+  {
+    ucvector raw_vec;
+    raw_vec.data = 0;
+    raw_vec.size = raw_vec.allocsize = 0;
+
+    if(tiled) {
+      size_t tiles_x = ((size_t)width + tile_w - 1) / tile_w;
+      size_t tiles_y = ((size_t)height + tile_h - 1) / tile_h;
+      num_chunks = tiles_x * tiles_y;
+    } else {
+      num_chunks = ((size_t)height + tile_h - 1) / tile_h;
+    }
+    /*PlanarConfiguration 2 stores one chunk sequence per component plane*/
+    if(planar_config == 2) num_chunks *= samples_per_pixel;
+    if(tag_tileoffsets) {
+      tag_offsets = tag_tileoffsets;
+      tag_counts = tag_tilecounts;
+    }
+    if(!tag_offsets || !tag_counts
+       || tag_offsets->count != num_chunks || tag_counts->count != num_chunks) {
+      lodepng_free(raw_vec.data);
+      error = 130;
+      goto cleanup;
+    }
+
+    for(chunk_index = 0; chunk_index < num_chunks; chunk_index++) {
+      unsigned long offset, byte_count;
+      if(tiff_tag_value(&tiff, tag_offsets, chunk_index, &offset)
+         || tiff_tag_value(&tiff, tag_counts, chunk_index, &byte_count)) {
+        lodepng_free(raw_vec.data);
+        error = 129;
+        goto cleanup;
+      }
+      if((size_t)offset + (size_t)byte_count < (size_t)offset
+         || (size_t)offset + (size_t)byte_count > insize) {
+        lodepng_free(raw_vec.data);
+        error = 129;
+        goto cleanup;
+      }
+      error = tiff_decode_chunk(&raw_vec, in + (size_t)offset, (size_t)byte_count, compression);
+      if(error) {
+        lodepng_free(raw_vec.data);
+        goto cleanup;
+      }
+    }
+    decoded = raw_vec.data;
+    decoded_size = raw_vec.size;
+  }
+
+  /*
+  Geometry of the packed (as-stored) sample stream.
+  - Chunky (PlanarConfiguration 1): each chunk row holds width*samples samples.
+  - Planar (PlanarConfiguration 2): every component has its own chunk
+    sequence; each chunk row holds one sample per pixel for that component.
+  Tiles are always full tile_w x tile_h, including at the image edges.
+  */
+  if(planar_config == 2) {
+    plane_row_bytes = tiff_scanline_bytes(tile_w, 1, bps);
+    chunks_per_plane = num_chunks / samples_per_pixel;
+  } else {
+    plane_row_bytes = tiff_scanline_bytes(tile_w, samples_per_pixel, bps);
+    chunks_per_plane = num_chunks;
+  }
+  if(plane_row_bytes == 0) { error = 77; goto cleanup; }
+  plane_chunk_bytes = plane_row_bytes * tile_h;
+  if(tiled) {
+    if(decoded_size < plane_chunk_bytes * num_chunks) { error = 131; goto cleanup; }
+  } else {
+    size_t full_strips = chunks_per_plane - 1;
+    size_t rows_in_last = height - full_strips * tile_h;
+    size_t per_plane_min;
+    if(rows_in_last > tile_h || rows_in_last == 0) { error = 130; goto cleanup; }
+    per_plane_min = full_strips * plane_chunk_bytes + plane_row_bytes * rows_in_last;
+    if(planar_config == 2) {
+      if(decoded_size < per_plane_min * samples_per_pixel) { error = 131; goto cleanup; }
+    } else {
+      if(decoded_size < per_plane_min) { error = 131; goto cleanup; }
+    }
+  }
+
+  /*build the PNG-compatible intermediate color mode describing the samples*/
+  lodepng_color_mode_init(&mode_in);
+  mode_in.bitdepth = bps < 8 ? 8 : bps;
+  if(photometric == 3) {
+    size_t map_count, map_entry;
+    mode_in.colortype = LCT_PALETTE;
+    mode_in.bitdepth = bps < 8 ? 8 : bps;
+    if(!tag_colormap || tag_colormap->count < (size_t)(1u << bps) * 3) { error = 134; goto cleanup2; }
+    map_count = (size_t)(1u << bps);
+    for(map_entry = 0; map_entry < map_count; map_entry++) {
+      unsigned long r16, g16, b16;
+      unsigned char r, g, b;
+      if(tiff_tag_value(&tiff, tag_colormap, map_entry, &r16)
+         || tiff_tag_value(&tiff, tag_colormap, map_count + map_entry, &g16)
+         || tiff_tag_value(&tiff, tag_colormap, 2 * map_count + map_entry, &b16)) {
+        error = 129;
+        goto cleanup2;
+      }
+      /*TIFF colormap is 16-bit, PNG palette is 8-bit*/
+      r = (unsigned char)(r16 >> 8);
+      g = (unsigned char)(g16 >> 8);
+      b = (unsigned char)(b16 >> 8);
+      error = lodepng_palette_add(&mode_in, r, g, b, 255);
+      if(error) goto cleanup2;
+    }
+  } else if(photometric == 2) {
+    mode_in.colortype = (samples_per_pixel == 4) ? LCT_RGBA : LCT_RGB;
+  } else {
+    mode_in.colortype = LCT_GREY;
+  }
+
+  /*normalize the packed samples into PNG raw layout (byte aligned, BE 16-bit)*/
+  out_row_bytes = tiff_scanline_bytes(width, samples_per_pixel, mode_in.bitdepth);
+  if(out_row_bytes == 0) { error = 77; goto cleanup2; }
+  if(lodepng_mulofl(out_row_bytes, (size_t)height, &pixels_size)) { error = 92; goto cleanup2; }
+
+  /*Bound the byte range the normalization loops will read from the decoded
+  sample buffer. A fetch addresses chunk-base + row-offset + sample-offset, so
+  the largest position is one full chunk past the highest chunk base. This is
+  computed up front (with overflow checks) so a malformed file declaring large
+  dimensions but little data cannot read past the end of the buffer.*/
+  {
+    size_t sample_unit = (bps <= 8) ? 1 : 2;
+    size_t samples_per_row = plane_row_bytes * 8 / bps;
+    size_t max_row_bytes, highest_chunk_base, required;
+    if(samples_per_row == 0) { error = 131; goto cleanup2; }
+    max_row_bytes = samples_per_row * sample_unit;
+    if(max_row_bytes < plane_row_bytes) max_row_bytes = plane_row_bytes;
+    if(num_chunks == 0) { error = 131; goto cleanup2; }
+    /*highest chunk base is (num_chunks-1) full chunks; a fetch can then read
+    up to one more row inside that final chunk*/
+    if(lodepng_mulofl(num_chunks - 1, plane_chunk_bytes, &highest_chunk_base)
+       || lodepng_addofl(highest_chunk_base, max_row_bytes, &required)) {
+      error = 77;
+      goto cleanup2;
+    }
+    if(decoded_size < required) { error = 131; goto cleanup2; }
+  }
+
+  pixels = (unsigned char*)lodepng_malloc(pixels_size);
+  if(!pixels) { error = 83; goto cleanup2; }
+  lodepng_memset(pixels, 0, pixels_size);
+
+  /*copy one stored sample value (possibly sub-byte or 16-bit) to the output*/
+  for(y = 0; y < height; y++) {
+    unsigned char* dst = pixels + y * out_row_bytes;
+    unsigned p;
+    for(p = 0; p < samples_per_pixel; p++) {
+      /*component plane this sample lives in (0 for chunky)*/
+      unsigned plane = (planar_config == 2) ? p : 0;
+      size_t strip, in_row, plane_base, src_row;
+      size_t x;
+      if(tiled) {
+        size_t tiles_x = ((size_t)width + tile_w - 1) / tile_w;
+        size_t ty = y / tile_h;
+        size_t local_y = y % tile_h;
+        size_t tx;
+        for(tx = 0; tx < tiles_x; tx++) {
+          size_t x_start = tx * tile_w;
+          size_t cols = LODEPNG_MIN((size_t)tile_w, (size_t)width - x_start);
+          size_t chunk = plane * chunks_per_plane + ty * tiles_x + tx;
+          size_t src_base = chunk * plane_chunk_bytes + local_y * plane_row_bytes;
+          size_t c;
+          for(c = 0; c < cols; c++) {
+            x = x_start + c;
+            if(bps < 8) {
+              /*in planar mode each stored row has one sample per pixel;
+              in chunky mode sample p of pixel c is at index c*samples+p*/
+              size_t sample_index = (planar_config == 2) ? c : c * samples_per_pixel + p;
+              dst[(x * samples_per_pixel + p)] =
+                  tiff_unpack_one(decoded + src_base, sample_index, bps, fill_order);
+            } else if(bps == 8) {
+              size_t sample_index = (planar_config == 2) ? c : c * samples_per_pixel + p;
+              dst[(x * samples_per_pixel + p)] = decoded[src_base + sample_index];
+            } else {
+              size_t sample_index = (planar_config == 2) ? c : c * samples_per_pixel + p;
+              {
+                const unsigned char* sp = decoded + src_base + sample_index * 2;
+                unsigned char* dp = dst + (x * samples_per_pixel + p) * 2;
+                if(tiff.little_endian) {
+                  dp[0] = sp[1];
+                  dp[1] = sp[0];
+                } else {
+                  dp[0] = sp[0];
+                  dp[1] = sp[1];
+                }
+              }
+            }
+          }
+        }
+      } else {
+        strip = y / tile_h;
+        in_row = y % tile_h;
+        plane_base = plane * chunks_per_plane * plane_chunk_bytes;
+        src_row = plane_base + strip * plane_chunk_bytes + in_row * plane_row_bytes;
+        for(x = 0; x < (size_t)width; x++) {
+          if(bps < 8) {
+            size_t sample_index = (planar_config == 2) ? x : x * samples_per_pixel + p;
+            dst[(x * samples_per_pixel + p)] =
+                tiff_unpack_one(decoded + src_row, sample_index, bps, fill_order);
+          } else if(bps == 8) {
+            size_t sample_index = (planar_config == 2) ? x : x * samples_per_pixel + p;
+            dst[(x * samples_per_pixel + p)] = decoded[src_row + sample_index];
+          } else {
+            size_t sample_index = (planar_config == 2) ? x : x * samples_per_pixel + p;
+            {
+              const unsigned char* sp = decoded + src_row + sample_index * 2;
+              unsigned char* dp = dst + (x * samples_per_pixel + p) * 2;
+              if(tiff.little_endian) {
+                dp[0] = sp[1];
+                dp[1] = sp[0];
+              } else {
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /*MinIsWhite grayscale: invert so the output follows PNG MinIsBlack semantics*/
+  if(photometric == 0) {
+    size_t num_samples = pixels_size / (mode_in.bitdepth / 8 == 0 ? 1 : mode_in.bitdepth / 8);
+    tiff_invert_samples(pixels, num_samples, mode_in.bitdepth);
+  }
+
+  /*convert to the color mode requested by the caller*/
+  lodepng_color_mode_init(&mode_out);
+  mode_out.colortype = colortype;
+  mode_out.bitdepth = bitdepth;
+  {
+    size_t final_size = lodepng_get_raw_size(width, height, &mode_out);
+    if(final_size == 0) { error = 92; lodepng_color_mode_cleanup(&mode_out); goto cleanup2; }
+    *out = (unsigned char*)lodepng_malloc(final_size);
+    if(!*out) {
+      error = 83;
+      lodepng_color_mode_cleanup(&mode_out);
+      goto cleanup2;
+    }
+    lodepng_memset(*out, 0, final_size);
+    error = lodepng_convert(*out, pixels, &mode_out, &mode_in, width, height);
+    lodepng_color_mode_cleanup(&mode_out);
+    if(error) {
+      lodepng_free(*out);
+      *out = 0;
+      goto cleanup2;
+    }
+  }
+
+  *w = width;
+  *h = height;
+  error = 0;
+
+cleanup2:
+  lodepng_color_mode_cleanup(&mode_in);
+cleanup:
+  lodepng_free(pixels);
+  lodepng_free(decoded);
+  lodepng_free(tiff.ifd.tags);
+  return error;
+}
+
+/*detect the TIFF byte order marks: II 0x2A 0x00 or MM 0x00 0x2A*/
+static int lodepng_is_tiff(const unsigned char* in, size_t insize) {
+  if(insize < 4) return 0;
+  if(in[0] == 'I' && in[1] == 'I' && in[2] == 42 && in[3] == 0) return 1;
+  if(in[0] == 'M' && in[1] == 'M' && in[2] == 0 && in[3] == 42) return 1;
+  return 0;
 }
 
 #endif /*LODEPNG_COMPILE_DECODER*/
@@ -7055,6 +7892,16 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    /*TIFF decoder errors*/
+    case 128: return "TIFF: invalid byte order mark or malformed header";
+    case 129: return "TIFF: IFD or field offset is outside of the file";
+    case 130: return "TIFF: required tag missing or has an invalid value";
+    case 131: return "TIFF: image data is smaller than the dimensions require";
+    case 132: return "TIFF: invalid or truncated LZW compressed data";
+    case 133: return "TIFF: unsupported compression method or field type";
+    case 134: return "TIFF: unsupported photometric, sample or planar configuration";
+    case 135: return "TIFF: tiled image layout is invalid";
+    case 136: return "TIFF: color map is missing or too small for the bit depth";
   }
   return "unknown error code";
 }

@@ -1,0 +1,30 @@
+# file result detail
+CROSSCHECK gray_1.tif EXACT badpx=0
+CROSSCHECK gray_5.tif EXACT badpx=0
+CROSSCHECK gray_8.tif EXACT badpx=0
+CROSSCHECK rgb_1.tif EXACT badpx=0
+CROSSCHECK rgb_5.tif EXACT badpx=0
+CROSSCHECK rgb_8.tif EXACT badpx=0
+CROSSCHECK rgba_1.tif EXACT badpx=0
+CROSSCHECK rgba_5.tif EXACT badpx=0
+CROSSCHECK rgba_8.tif EXACT badpx=0
+CROSSCHECK palette_1.tif EXACT badpx=0
+CROSSCHECK palette_5.tif EXACT badpx=0
+CROSSCHECK palette_8.tif EXACT badpx=0
+CROSSCHECK planar_1.tif EXACT badpx=0
+CROSSCHECK planar_5.tif EXACT badpx=0
+CROSSCHECK planar_8.tif EXACT badpx=0
+CROSSCHECK tiles_1.tif EXACT badpx=0
+CROSSCHECK tiles_5.tif EXACT badpx=0
+CROSSCHECK tiles_8.tif EXACT badpx=0
+CROSSCHECK multipage_1.tif EXACT badpx=0
+CROSSCHECK multipage_5.tif EXACT badpx=0
+CROSSCHECK multipage_8.tif EXACT badpx=0
+CROSSCHECK miniswhite_1.tif EXACT badpx=0
+CROSSCHECK gray1_1.tif SCALING-OK raw 0/1 samples preserved=True order=True
+CROSSCHECK gray1_5.tif SCALING-OK raw 0/1 samples preserved=True order=True
+CROSSCHECK gray1_8.tif SCALING-OK raw 0/1 samples preserved=True order=True
+CROSSCHECK gray16_1.tif SCALING-OK 16-bit samples match source=768/768
+CROSSCHECK gray16_5.tif SCALING-OK 16-bit samples match source=768/768
+CROSSCHECK gray16_8.tif SCALING-OK 16-bit samples match source=768/768
+CROSSCHECK ALL OK

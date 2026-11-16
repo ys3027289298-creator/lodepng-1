@@ -1,0 +1,48 @@
+# name error w h bytes crc32 ms/iter peak_bytes live_after
+RESULT gray_1.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0012 peak=5088 live=0
+RESULT gray_5.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0041 peak=5384 live=0
+RESULT gray_8.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0056 peak=8548 live=0
+RESULT rgb_1.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0026 peak=8160 live=0
+RESULT rgb_5.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0207 peak=8252 live=0
+RESULT rgb_8.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0030 peak=8160 live=0
+RESULT rgba_1.tif OK err=0 w=32 h=24 bytes=3072 crc=416c2ac8 ms=0.0047 peak=9696 live=0
+RESULT rgba_5.tif OK err=0 w=32 h=24 bytes=3072 crc=416c2ac8 ms=0.0210 peak=10219 live=0
+RESULT rgba_8.tif OK err=0 w=32 h=24 bytes=3072 crc=416c2ac8 ms=0.0036 peak=9696 live=0
+RESULT gray16_1.tif OK err=0 w=32 h=24 bytes=3072 crc=7a82a28a ms=0.0016 peak=6624 live=0
+RESULT gray16_5.tif OK err=0 w=32 h=24 bytes=3072 crc=7a82a28a ms=0.0100 peak=6685 live=0
+RESULT gray16_8.tif OK err=0 w=32 h=24 bytes=3072 crc=7a82a28a ms=0.0018 peak=6624 live=0
+RESULT gray1_1.tif OK err=0 w=32 h=24 bytes=3072 crc=a184c46c ms=0.0011 peak=4416 live=0
+RESULT gray1_5.tif OK err=0 w=32 h=24 bytes=3072 crc=a184c46c ms=0.0013 peak=4459 live=0
+RESULT gray1_8.tif OK err=0 w=32 h=24 bytes=3072 crc=a184c46c ms=0.0040 peak=8548 live=0
+RESULT palette_1.tif OK err=0 w=32 h=24 bytes=3072 crc=1767dac9 ms=0.0014 peak=5768 live=0
+RESULT palette_5.tif OK err=0 w=32 h=24 bytes=3072 crc=1767dac9 ms=0.0021 peak=5856 live=0
+RESULT palette_8.tif OK err=0 w=32 h=24 bytes=3072 crc=1767dac9 ms=0.0045 peak=8588 live=0
+RESULT planar_1.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0024 peak=9120 live=0
+RESULT planar_5.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0124 peak=8252 live=0
+RESULT planar_8.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0143 peak=10468 live=0
+RESULT tiles_1.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0032 peak=9160 live=0
+RESULT tiles_5.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0188 peak=9491 live=0
+RESULT tiles_8.tif OK err=0 w=32 h=24 bytes=3072 crc=664e7837 ms=0.0143 peak=11852 live=0
+RESULT multipage_1.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0011 peak=5008 live=0
+RESULT multipage_5.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0041 peak=5304 live=0
+RESULT multipage_8.tif OK err=0 w=32 h=24 bytes=3072 crc=c356a645 ms=0.0049 peak=8468 live=0
+RESULT miniswhite_1.tif OK err=0 w=32 h=24 bytes=3072 crc=b8083423 ms=0.0014 peak=5088 live=0
+RESULT corrupt_lzw5.tif OK_ERROR code=132 text=TIFF: invalid or truncated LZW compressed data peak=794 live=0
+RESULT corrupt_deflate8.tif OK_ERROR code=52 text=jumped past memory while inflating peak=8548 live=0
+RESULT badcompress_1.tif OK_ERROR code=133 text=TIFF: unsupported compression method or field type peak=480 live=0
+RESULT badphotometric_1.tif OK_ERROR code=134 text=TIFF: unsupported photometric, sample or planar configuration peak=480 live=0
+RESULT badoffset_1.tif OK_ERROR code=129 text=TIFF: IFD or field offset is outside of the file peak=480 live=0
+RESULT truncated_1.tif OK_ERROR code=129 text=TIFF: IFD or field offset is outside of the file peak=480 live=0
+CROSS gray IDENTICAL crc=c356a645 bytes=3072
+CROSS rgb IDENTICAL crc=664e7837 bytes=3072
+CROSS rgba IDENTICAL crc=416c2ac8 bytes=3072
+CROSS gray16 IDENTICAL crc=7a82a28a bytes=3072
+CROSS gray1 IDENTICAL crc=a184c46c bytes=3072
+CROSS palette IDENTICAL crc=1767dac9 bytes=3072
+CROSS planar IDENTICAL crc=664e7837 bytes=3072
+CROSS tiles IDENTICAL crc=664e7837 bytes=3072
+CROSS multipage IDENTICAL crc=c356a645 bytes=3072
+MULTIPAGE first-page selection OK
+ROUTING non-TIFF correctly rejected by PNG path (28)
+PNG sanity OK (roundtrip through shared entry point)
+ALL CHECKS PASSED
