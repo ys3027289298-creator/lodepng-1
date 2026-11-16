@@ -3299,6 +3299,10 @@ unsigned lodepng_set_icc(LodePNGInfo* info, const char* name, const unsigned cha
   if(info->iccp_defined) lodepng_clear_icc(info);
 
   if(profile_size == 0) return 123; /*invalid ICC profile size*/
+  if(!name) return 89; /*invalid keyword*/
+  /*a nonzero size with no buffer would be copied from NULL: reject it as a failed allocation of the
+  profile copy rather than crashing*/
+  if(!profile) return 83;
 
   info->iccp_name = alloc_string(name);
   if(!info->iccp_name) return 83; /*alloc fail*/
@@ -3306,6 +3310,9 @@ unsigned lodepng_set_icc(LodePNGInfo* info, const char* name, const unsigned cha
   info->iccp_profile = (unsigned char*)lodepng_malloc(profile_size);
   if(!info->iccp_profile) {
     lodepng_free(info->iccp_name);
+    /*don't leave a dangling name behind: lodepng_clear_icc on a later cleanup would free it again*/
+    info->iccp_name = NULL;
+    info->iccp_profile_size = 0;
     return 83; /*alloc fail*/
   }
 
@@ -5128,12 +5135,16 @@ static unsigned readChunk_iCCP(LodePNGInfo* info, const LodePNGDecoderSettings* 
   /*copy the object to change parameters in it*/
   LodePNGDecompressSettings zlibsettings = decoder->zlibsettings;
 
-  unsigned length, string2_begin;
+  size_t length, string2_begin;
 
   if(info->iccp_defined) lodepng_clear_icc(info);
 
+  /*The chunk data consists of: profile name, null byte, compression method (0), zlib data. Find the
+  end of the name. The chunk's own length field determines chunkLength, so a declared length that is
+  shorter than the actual name + null + method + zlib data (or longer than the bytes available in the
+  file) is caught here or by the zlib/CRC/ADLER32 checks below and reported as an error.*/
   for(length = 0; length < chunkLength && data[length] != 0; ++length) ;
-  if(length + 2 >= chunkLength) return 75; /*no null termination, corrupt?*/
+  if(length + 2 >= chunkLength) return 75; /*no null termination or no zlib data, corrupt?*/
   if(length < 1 || length > 79) return 89; /*keyword too short or long*/
 
   info->iccp_name = (char*)lodepng_malloc(length + 1);
@@ -5142,22 +5153,36 @@ static unsigned readChunk_iCCP(LodePNGInfo* info, const LodePNGDecoderSettings* 
   info->iccp_name[length] = 0;
   for(i = 0; i != length; ++i) info->iccp_name[i] = (char)data[i];
 
-  if(data[length + 1] != 0) return 72; /*the 0 byte indicating compression must be 0*/
+  if(data[length + 1] != 0) {
+    lodepng_clear_icc(info); /*don't leave a name behind without a defined profile*/
+    return 72; /*the 0 byte indicating compression must be 0*/
+  }
 
   string2_begin = length + 2;
-  if(string2_begin > chunkLength) return 75; /*no null termination, corrupt?*/
+  if(string2_begin > chunkLength) {
+    lodepng_clear_icc(info);
+    return 75; /*no null termination, corrupt?*/
+  }
 
-  length = (unsigned)chunkLength - string2_begin;
+  length = chunkLength - string2_begin;
   zlibsettings.max_output_size = decoder->max_icc_size;
   error = zlib_decompress(&info->iccp_profile, &size, 0,
                           &data[string2_begin],
                           length, &zlibsettings);
-  /*error: ICC profile larger than decoder->max_icc_size*/
-  if(error && size > zlibsettings.max_output_size) error = 113;
+  /*error: ICC profile larger than decoder->max_icc_size (only if a limit is set, a max of 0 means
+  unlimited and must not translate unrelated decompression errors into this one)*/
+  if(error && zlibsettings.max_output_size && size > zlibsettings.max_output_size) error = 113;
   info->iccp_profile_size = (unsigned)size;
   if(!error && !info->iccp_profile_size) error = 123; /*invalid ICC profile size*/
 
-  if(!error) info->iccp_defined = 1;
+  if(!error) {
+    info->iccp_defined = 1;
+  } else {
+    /*Drop the partially decompressed profile and the name: a failed iCCP chunk must not leave a
+    half-filled profile visible to the caller. The buffer is kept allocated by lodepng_clear_icc's
+    free, so this cannot fail.*/
+    lodepng_clear_icc(info);
+  }
   return error;
 }
 
@@ -5963,8 +5988,17 @@ static unsigned addChunk_iCCP(ucvector* out, const LodePNGInfo* info, const Lode
   error = zlib_compress(&compressed, &compressedsize,
                         info->iccp_profile, info->iccp_profile_size, zlibsettings);
   if(!error) {
-    size_t size = keysize + 2 + compressedsize;
-    error = lodepng_chunk_init(&chunk, out, size, "iCCP");
+    /*chunk data is: keyword, 0, compression method 0, compressed profile. A PNG chunk's data length
+    must fit its 31-bit length field (max 2147483647 bytes), so reject a profile that grows the chunk
+    beyond that instead of silently writing a length field that doesn't match the data.*/
+    size_t size;
+    if(lodepng_addofl(keysize, 2, &size) || lodepng_addofl(size, compressedsize, &size)) {
+      error = 77; /*integer overflow in buffer size*/
+    } else if(size > 2147483647u) {
+      error = 63; /*length of a chunk too long*/
+    } else {
+      error = lodepng_chunk_init(&chunk, out, size, "iCCP");
+    }
   }
   if(!error) {
     lodepng_memcpy(chunk + 8, info->iccp_name, keysize);
