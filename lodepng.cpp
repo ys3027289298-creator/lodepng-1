@@ -5311,10 +5311,104 @@ unsigned lodepng_inspect_chunk(LodePNGState* state, size_t pos,
   return error;
 }
 
+/*Partial decoding (recovery of truncated IDAT data). The public configuration and
+result types for this feature are declared together with lodepng_decode_memory_partial
+further below; everything needed internally is kept in this context.*/
+typedef struct LodePNGPartialContext {
+  unsigned strict;       /*if nonzero, behave exactly like the regular decoder*/
+  unsigned fill_strategy;/*LodePNGPartialFill strategy for undecodable rows*/
+  unsigned char fill_rgba[4]; /*fill color as 8-bit RGBA, used by the COLOR strategy*/
+  unsigned rows_done;    /*amount of fully decoded rows in the PNG's own color type*/
+  unsigned recovered;    /*nonzero if a truncation was recovered from instead of reported*/
+} LodePNGPartialContext;
+
+/*Returns nonzero only for error codes that can be caused by the PNG being cut off
+before or inside the IDAT image data. Other failures (e.g. a missing PLTE chunk in a
+palette image, bad CRC, unsupported color conversion) are structural and must keep
+their strict behavior even in partial mode.*/
+static unsigned partialIsTruncationError(unsigned code) {
+  switch(code) {
+    case 30:  /*chunk broken off at the end of the file*/
+    case 50:  /*inflate bit pointer runs past memory while building a huffman tree*/
+    case 51:  /*deflate bit pointer jumps past memory*/
+    case 52:  /*deflate stream ends unexpectedly / backward distance too long*/
+    case 53:  /*zlib data too small*/
+    case 57:  /*CRC of a cut-off chunk*/
+    case 58:  /*adler32 missing or wrong because the stream tail was cut off*/
+    case 64:  /*in buffer too small to contain the next chunk*/
+    case 91:  /*decompressed IDAT size smaller than predicted*/
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/*Bounded version of unfilter() for truncated data. It reconstructs only scanlines whose
+full filtered encoding (filter byte + linebytes) is present in the available input, and
+writes the actual amount of fully decoded rows to *rows_out. A partially present final
+scanline is never reconstructed, so every output row is complete and valid.*/
+static unsigned unfilterPartial(unsigned char* out, const unsigned char* in,
+                                unsigned w, unsigned h, unsigned bpp,
+                                size_t available, unsigned* rows_out) {
+  size_t bytewidth = (bpp + 7u) / 8u;
+  size_t linebytes = lodepng_get_raw_size_idat(w, 1, bpp) - 1u;
+  size_t rowstride = linebytes + 1u; /*includes the filter byte*/
+  unsigned char* prevline = 0;
+  unsigned y;
+  unsigned rows = (unsigned)(available / rowstride);
+  if(rows > h) rows = h;
+
+  for(y = 0; y < rows; ++y) {
+    size_t outindex = linebytes * y;
+    size_t inindex = rowstride * y;
+    unsigned char filterType = in[inindex];
+    unsigned error = unfilterScanline(&out[outindex], &in[inindex + 1], prevline,
+                                      bytewidth, filterType, linebytes);
+    if(error) {
+      *rows_out = y; /*this and every following row are not available*/
+      return error;
+    }
+    prevline = &out[outindex];
+  }
+  *rows_out = rows;
+  return 0;
+}
+
+/*Post-process only the scanlines fully present in the truncated IDAT stream of a
+non-interlaced image into out (sized for the complete image). Rows beyond the available
+data are left untouched; the caller fills them in afterwards. *rows_out reports the
+amount of fully decoded rows. Returns a regular error code.*/
+static unsigned postProcessScanlinesPartial(unsigned char* out, unsigned char* in,
+                                            unsigned w, unsigned h, size_t available,
+                                            const LodePNGInfo* info_png,
+                                            unsigned* rows_out) {
+  unsigned bpp = lodepng_get_bpp(&info_png->color);
+  *rows_out = 0;
+  if(bpp == 0) return 31; /*error: invalid colortype*/
+  if(info_png->interlace_method != 0) return 69; /*Adam7 recovery is not supported*/
+  if(available == 0) return 0; /*nothing decoded yet, the caller fills every row*/
+
+  if(bpp < 8 && w * bpp != ((w * bpp + 7u) / 8u) * 8u) {
+    /*unfilter works in place on 'in', then the padding bits are removed row by row*/
+    unsigned rows = 0;
+    unsigned error = unfilterPartial(in, in, w, h, bpp, available, &rows);
+    if(error && rows == 0) return error;
+    if(rows) removePaddingBits(out, in, w * bpp, ((w * bpp + 7u) / 8u) * 8u, rows);
+    *rows_out = rows;
+  } else {
+    unsigned rows = 0;
+    unsigned error = unfilterPartial(out, in, w, h, bpp, available, &rows);
+    if(error && rows == 0) return error;
+    *rows_out = rows;
+  }
+  return 0;
+}
+
 /*read a PNG, the result will be in the same color type as the PNG (hence "generic")*/
 static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
                           LodePNGState* state,
-                          const unsigned char* in, size_t insize) {
+                          const unsigned char* in, size_t insize,
+                          LodePNGPartialContext* partial) {
   unsigned char IEND = 0;
   const unsigned char* chunk; /*points to beginning of next chunk*/
   unsigned char* idat; /*the data from idat chunks, zlib compressed*/
@@ -5356,7 +5450,7 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
 
     /*error: next chunk out of bounds of the in buffer*/
     if(chunk < in || pos + 12 > insize) {
-      if(state->decoder.ignore_end) break; /*other errors may still happen though*/
+      if(state->decoder.ignore_end || (partial && !partial->strict)) break; /*recover with the IDAT data gathered so far*/
       CERROR_BREAK(state->error, 30);
     }
 
@@ -5364,11 +5458,13 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
     chunkLength = lodepng_chunk_length(chunk);
     /*error: chunk length larger than the max PNG chunk size*/
     if(chunkLength > 2147483647) {
-      if(state->decoder.ignore_end) break; /*other errors may still happen though*/
+      if(state->decoder.ignore_end || (partial && !partial->strict)) break; /*recover with the IDAT data gathered so far*/
       CERROR_BREAK(state->error, 63);
     }
 
     if(pos + (size_t)chunkLength + 12 > insize || pos + (size_t)chunkLength + 12 < pos) {
+      /*A truncated final chunk: in partial mode keep the complete IDAT chunks gathered before it.*/
+      if(partial && !partial->strict) break;
       CERROR_BREAK(state->error, 64); /*error: size of the in buffer too small to contain next chunk (or int overflow)*/
     }
 
@@ -5515,6 +5611,24 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
     state->error = zlib_decompress(&scanlines, &scanlines_size, expected_size, idat, idatsize, &state->decoder.zlibsettings);
   }
   if(!state->error && scanlines_size != expected_size) state->error = 91; /*decompressed size doesn't match prediction*/
+
+  if(partial && !partial->strict && state->error) {
+    /*Partial recovery is only attempted for non-interlaced images: Adam7 interlacing mixes
+    rows of several reduced images, so a row count cannot be reported meaningfully.
+    Only errors caused by the image data being cut off are recovered from; structural
+    problems such as a missing PLTE keep their strict error code.*/
+    if(partialIsTruncationError(state->error) && state->info_png.interlace_method == 0) {
+      unsigned bpp = lodepng_get_bpp(&state->info_png.color);
+      size_t rowstride = lodepng_get_raw_size_idat(*w, 1, bpp); /*filter byte + one row*/
+      partial->recovered = 1;
+      state->error = 0;
+      /*A truncated stream can emit bytes past the last complete scanline, or (when the
+      deflate block boundary is lost) slightly more than the predicted size. Discard every
+      byte that does not belong to a whole scanline so only intact rows are reconstructed.*/
+      if(scanlines_size > expected_size) scanlines_size = expected_size;
+      scanlines_size = (scanlines_size / rowstride) * rowstride;
+    }
+  }
   lodepng_free(idat);
 
   if(!state->error) {
@@ -5524,7 +5638,15 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
   }
   if(!state->error) {
     lodepng_memset(*out, 0, outsize);
-    state->error = postProcessScanlines(*out, scanlines, *w, *h, &state->info_png);
+    if(partial && partial->recovered) {
+      unsigned rows_done = 0;
+      state->error = postProcessScanlinesPartial(*out, scanlines, *w, *h,
+                                                 scanlines_size, &state->info_png, &rows_done);
+      if(!state->error) partial->rows_done = rows_done;
+    } else {
+      state->error = postProcessScanlines(*out, scanlines, *w, *h, &state->info_png);
+      if(!state->error && partial) partial->rows_done = *h;
+    }
   }
   lodepng_free(scanlines);
 }
@@ -5533,7 +5655,7 @@ unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
                         LodePNGState* state,
                         const unsigned char* in, size_t insize) {
   *out = 0;
-  decodeGeneric(out, w, h, state, in, insize);
+  decodeGeneric(out, w, h, state, in, insize, 0);
   if(state->error) goto cleanup;
   if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
     /*same color type, no copying or converting of data needed*/
@@ -5587,6 +5709,197 @@ unsigned lodepng_decode_memory(unsigned char** out, unsigned* w, unsigned* h, co
   state.decoder.remember_unknown_chunks = 0;
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
   error = lodepng_decode(out, w, h, &state, in, insize);
+  lodepng_state_cleanup(&state);
+  return error;
+}
+
+/*
+Partial decoding: attempt to recover images whose IDAT data is truncated (e.g. an
+interrupted download). Everything except the IDAT payload is handled by the regular
+decoder; scanlines that cannot be decoded are filled in instead of reported as errors.
+The public types and the return code LODEPNG_PARTIAL_SUCCESS are defined below so that
+no header changes are needed: existing declarations and behavior stay untouched.
+
+When options->strict is nonzero the behavior is identical to lodepng_decode_memory.
+When it is zero, a truncated stream returns LODEPNG_PARTIAL_SUCCESS (130), a fully
+intact image returns 0, and any other corruption still returns the regular error code.
+result->rows_done reports the amount of scanlines actually decoded (0 if none, equal to
+the image height on full success); the remaining rows are filled per options->fill_strategy.
+*/
+#define LODEPNG_PARTIAL_SUCCESS 130
+#define LODEPNG_PARTIAL_STRICT 1
+#define LODEPNG_PARTIAL_FILL_REPEAT 0 /*undecodable rows repeat the last decoded row*/
+#define LODEPNG_PARTIAL_FILL_BLACK 1  /*undecodable rows are filled with zero bytes*/
+#define LODEPNG_PARTIAL_FILL_COLOR 2  /*undecodable rows are filled with options->fill_rgba*/
+
+typedef struct LodePNGPartialDecodeOptions {
+  unsigned strict;        /*nonzero: behave exactly like lodepng_decode_memory*/
+  unsigned fill_strategy; /*one of the LODEPNG_PARTIAL_FILL_* values*/
+  unsigned char fill_rgba[4]; /*8-bit RGBA fill color for the COLOR strategy*/
+} LodePNGPartialDecodeOptions;
+
+typedef struct LodePNGPartialDecodeResult {
+  unsigned rows_done; /*amount of fully decoded scanlines; the rest was filled*/
+  unsigned recovered; /*nonzero if truncation was recovered from (partial success)*/
+} LodePNGPartialDecodeResult;
+
+/*Fill rows [first_row, h) of the output image. The output buffer holds the full image
+in state->info_raw format; rows before first_row are already valid.*/
+static unsigned partialFillRemaining(unsigned char* image, unsigned w, unsigned h, unsigned first_row,
+                                     const LodePNGState* state,
+                                     const LodePNGPartialDecodeOptions* options) {
+  size_t rowbytes = lodepng_get_raw_size(w, 1, &state->info_raw);
+  size_t y;
+
+  if(first_row >= h) return 0;
+
+  if(options->fill_strategy == LODEPNG_PARTIAL_FILL_REPEAT && first_row > 0) {
+    const unsigned char* previous = &image[(size_t)(first_row - 1) * rowbytes];
+    for(y = first_row; y < h; ++y) lodepng_memcpy(&image[y * rowbytes], previous, rowbytes);
+    return 0;
+  }
+
+  if(options->fill_strategy == LODEPNG_PARTIAL_FILL_COLOR) {
+    /*Build one fill row in the requested output color type by converting an RGBA row
+    filled with the requested color; lodepng_convert works on whole images, so the input
+    buffer has the full row length. If the conversion is unsupported, fall back to zero.*/
+    unsigned char* fillrow = (unsigned char*)lodepng_malloc(rowbytes);
+    unsigned char* rgba_row = (unsigned char*)lodepng_malloc((size_t)w * 4u);
+    LodePNGColorMode mode_rgba;
+    unsigned error;
+    size_t p;
+    if(!fillrow || !rgba_row) {
+      lodepng_free(fillrow);
+      lodepng_free(rgba_row);
+      return 83; /*alloc fail*/
+    }
+    lodepng_memset(fillrow, 0, rowbytes);
+    for(p = 0; p < (size_t)w; ++p) {
+      rgba_row[p * 4 + 0] = options->fill_rgba[0];
+      rgba_row[p * 4 + 1] = options->fill_rgba[1];
+      rgba_row[p * 4 + 2] = options->fill_rgba[2];
+      rgba_row[p * 4 + 3] = options->fill_rgba[3];
+    }
+    lodepng_color_mode_init(&mode_rgba);
+    mode_rgba.colortype = LCT_RGBA;
+    mode_rgba.bitdepth = 8;
+    error = lodepng_convert(fillrow, rgba_row, &state->info_raw, &mode_rgba, w, 1);
+    lodepng_color_mode_cleanup(&mode_rgba);
+    lodepng_free(rgba_row);
+    if(!error) {
+      for(y = first_row; y < h; ++y) lodepng_memcpy(&image[y * rowbytes], fillrow, rowbytes);
+    } else {
+      for(y = first_row; y < h; ++y) lodepng_memset(&image[y * rowbytes], 0, rowbytes);
+    }
+    lodepng_free(fillrow);
+    return 0;
+  }
+
+  /*BLACK, or REPEAT when no row was decoded: zero the remaining rows*/
+  for(y = first_row; y < h; ++y) lodepng_memset(&image[y * rowbytes], 0, rowbytes);
+  return 0;
+}
+
+unsigned lodepng_decode_memory_partial(unsigned char** out, unsigned* w, unsigned* h,
+                                       const unsigned char* in, size_t insize,
+                                       LodePNGColorType colortype, unsigned bitdepth,
+                                       const LodePNGPartialDecodeOptions* options,
+                                       LodePNGPartialDecodeResult* result) {
+  LodePNGState state;
+  LodePNGPartialContext partial;
+  LodePNGPartialDecodeOptions default_options;
+  const LodePNGPartialDecodeOptions* effective_options;
+  unsigned error;
+
+  if(result) { result->rows_done = 0; result->recovered = 0; }
+  *out = 0;
+  *w = *h = 0;
+
+  /*A NULL options pointer selects non-strict mode with the default repeat strategy.*/
+  lodepng_memset(&default_options, 0, sizeof(default_options));
+  default_options.strict = 0;
+  default_options.fill_strategy = LODEPNG_PARTIAL_FILL_REPEAT;
+  default_options.fill_rgba[3] = 255;
+  effective_options = options ? options : &default_options;
+
+  if(effective_options->strict) {
+    /*Strict mode: identical behavior and return codes as the regular decoder.
+    Report the full height on success and zero recovered rows on failure so the
+    result struct stays meaningful in both modes.*/
+    unsigned strict_error = lodepng_decode_memory(out, w, h, in, insize, colortype, bitdepth);
+    if(result) {
+      result->recovered = 0;
+      result->rows_done = strict_error ? 0 : *h;
+    }
+    return strict_error;
+  }
+
+  lodepng_state_init(&state);
+  state.info_raw.colortype = colortype;
+  state.info_raw.bitdepth = bitdepth;
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+  /*disable reading things that this function doesn't output*/
+  state.decoder.read_text_chunks = 0;
+  state.decoder.remember_unknown_chunks = 0;
+#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+
+  lodepng_memset(&partial, 0, sizeof(partial));
+  partial.fill_strategy = effective_options->fill_strategy;
+  partial.fill_rgba[0] = effective_options->fill_rgba[0];
+  partial.fill_rgba[1] = effective_options->fill_rgba[1];
+  partial.fill_rgba[2] = effective_options->fill_rgba[2];
+  partial.fill_rgba[3] = effective_options->fill_rgba[3];
+
+  decodeGeneric(out, w, h, &state, in, insize, &partial);
+
+  if(state.error) {
+    error = state.error;
+    goto partial_cleanup;
+  }
+
+  if(!state.decoder.color_convert || lodepng_color_mode_equal(&state.info_raw, &state.info_png.color)) {
+    if(!state.decoder.color_convert) {
+      state.error = lodepng_color_mode_copy(&state.info_raw, &state.info_png.color);
+      if(state.error) { error = state.error; goto partial_cleanup; }
+    }
+  } else { /*color conversion needed, same rules as in lodepng_decode*/
+    unsigned char* data = *out;
+    size_t outsize;
+    if(!(state.info_raw.colortype == LCT_RGB || state.info_raw.colortype == LCT_RGBA)
+       && !(state.info_raw.bitdepth == 8)) {
+      state.error = 56; /*unsupported color mode conversion*/
+      error = state.error;
+      goto partial_cleanup;
+    }
+    outsize = lodepng_get_raw_size(*w, *h, &state.info_raw);
+    *out = (unsigned char*)lodepng_malloc(outsize);
+    if(!(*out)) {
+      lodepng_free(data);
+      error = 83; /*alloc fail*/
+      goto partial_cleanup;
+    }
+    state.error = lodepng_convert(*out, data, &state.info_raw, &state.info_png.color, *w, *h);
+    lodepng_free(data);
+    if(state.error) { error = state.error; goto partial_cleanup; }
+  }
+
+  if(partial.recovered) {
+    state.error = partialFillRemaining(*out, *w, *h, partial.rows_done, &state, effective_options);
+    if(state.error) { error = state.error; goto partial_cleanup; }
+  }
+
+  if(result) {
+    result->rows_done = partial.rows_done;
+    result->recovered = partial.recovered;
+  }
+  error = partial.recovered ? LODEPNG_PARTIAL_SUCCESS : 0;
+
+partial_cleanup:
+  /*LODEPNG_PARTIAL_SUCCESS is a success code: the output buffer must be kept.*/
+  if(error && error != LODEPNG_PARTIAL_SUCCESS) {
+    lodepng_free(*out);
+    *out = 0;
+  }
   lodepng_state_cleanup(&state);
   return error;
 }
@@ -7055,6 +7368,7 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case LODEPNG_PARTIAL_SUCCESS: return "partial success: truncated image data, undecodable scanlines were filled in";
   }
   return "unknown error code";
 }
