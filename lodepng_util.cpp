@@ -25,6 +25,53 @@ freely, subject to the following restrictions:
 
 #include "lodepng_util.h"
 #include <stdlib.h> /* allocations */
+#include <stdio.h>  /* snprintf for the version number */
+#include <string.h> /* strlen, memcmp */
+
+/*
+Public declarations of the version compatibility layer. They are defined
+later in this same file and are also made available to code that includes
+lodepng_util.h via the declaration block guarded below. No other file is
+modified.
+*/
+namespace lodepng {
+namespace compat {
+
+/* Current on-disk format version produced by this layer. */
+extern const unsigned PNG_VERSION_CURRENT;
+/* Format version assumed for files that carry no "Version" tEXt chunk. */
+extern const unsigned PNG_VERSION_LEGACY;
+/* Error code for a file newer than what this layer can upgrade. */
+extern const unsigned ERR_VERSION_TOO_NEW;
+
+/* What was found in, and done to, a single file. */
+struct UpgradeReport {
+  unsigned input_version;          /* PNG_VERSION_LEGACY when no Version chunk */
+  unsigned output_version;         /* always PNG_VERSION_CURRENT on success */
+  bool had_srgb;
+  bool had_iccp;
+  bool had_text;                   /* any tEXt/zTXt/iTXt chunk present */
+  bool had_version_chunk;
+  bool added_srgb;
+  bool added_iccp;
+  bool added_text;                 /* Version/UpgradeReport text chunks added */
+  bool upgraded;                   /* output differs from input on disk */
+  std::vector<std::string> report; /* human readable, one entry per action/fact */
+};
+
+/* Read-only inspection: recognizes what is missing and the defaults that
+would be applied. Never modifies the input. Returns 0 or a lodepng error. */
+unsigned inspectPng(const std::vector<unsigned char>& png, UpgradeReport& info);
+
+/* Inspect, fill defaults for everything that is missing, and write the file
+back at the current version. On failure out is left empty and a lodepng
+error code is returned; no partially upgraded file is produced. */
+unsigned upgradePng(const std::vector<unsigned char>& png,
+                    std::vector<unsigned char>& out,
+                    UpgradeReport& info);
+
+} // namespace compat
+} // namespace lodepng
 
 namespace lodepng {
 
@@ -1455,5 +1502,463 @@ unsigned convertFromSrgb(unsigned char* out, const unsigned char* in,
 }
 
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+
+/*
+================================================================================
+Version compatibility layer
+================================================================================
+This is a self-contained, chunk-level layer on top of the regular LodePNG
+codec. It does not modify, and is not used by, the normal encode/decode code
+paths: lodepng::decode / lodepng::encode behave byte-identically whether this
+layer is used or not.
+
+On-disk versioning convention used by the old project this layer supports:
+
+  * The format version is carried in an optional tEXt chunk with keyword
+    "Version", whose text is the decimal version number.
+  * A PNG without a "Version" tEXt chunk is a legacy file (version 1).
+  * The current format is version 2. Version 2 files always contain:
+      - an sRGB chunk (rendering intent 0, perceptual),
+      - an iCCP chunk holding a (compressed) sRGB ICC profile,
+      - tEXt chunks with keywords "Version" and "UpgradeReport".
+  * When a legacy file is read through this layer, the missing pieces are
+    reported and, on write, filled in with documented default values, and the
+    file is upgraded to the current version. An upgrade that cannot be
+    performed (corrupt PNG, unknown newer version, ...) fails with an error
+    code instead of silently producing output.
+
+Only the public chunk/zlib API of lodepng.h is used here.
+*/
+
+namespace compat {
+
+/* Definitions of the constants declared near the top of this file. */
+const unsigned PNG_VERSION_CURRENT = 2;
+/* Format version assumed for files that carry no "Version" tEXt chunk. */
+const unsigned PNG_VERSION_LEGACY = 1;
+
+/* Error code returned when a file claims to be newer than what this layer
+can upgrade. 124 is an unused slot in lodepng's error code list. */
+const unsigned ERR_VERSION_TOO_NEW = 124;
+
+const char VERSION_KEYWORD[] = "Version";
+const char REPORT_KEYWORD[] = "UpgradeReport";
+const char ICC_PROFILE_NAME[] = "sRGB";
+const unsigned char DEFAULT_SRGB_INTENT = 0; /* 0 = perceptual */
+
+/* A fully parsed chunk (length field excluded; raw includes type + data + crc). */
+struct Chunk {
+  std::string type;
+  std::vector<unsigned char> raw; /* whole chunk as on disk: 4 len, type, data, crc */
+};
+
+static void put32(std::vector<unsigned char>& v, unsigned value) {
+  v.push_back((unsigned char)((value >> 24) & 0xff));
+  v.push_back((unsigned char)((value >> 16) & 0xff));
+  v.push_back((unsigned char)((value >>  8) & 0xff));
+  v.push_back((unsigned char)( value        & 0xff));
+}
+
+static void appendBytes(std::vector<unsigned char>& v, const void* data, size_t size) {
+  if(size == 0) return;
+  const unsigned char* p = (const unsigned char*)data;
+  v.insert(v.end(), p, p + size);
+}
+
+static void appendBytes(std::vector<unsigned char>& v,
+                        const std::vector<unsigned char>& src) {
+  v.insert(v.end(), src.begin(), src.end());
+}
+
+/* Build a complete chunk (length + type + data + correct CRC). */
+static std::vector<unsigned char> makeChunk(const char* type,
+                                            const unsigned char* data, size_t size) {
+  std::vector<unsigned char> raw;
+  put32(raw, (unsigned)size);
+  appendBytes(raw, type, 4);
+  appendBytes(raw, data, size);
+  unsigned crc = lodepng_crc32(raw.empty() ? 0 : &raw[4], size + 4);
+  put32(raw, crc);
+  return raw;
+}
+
+static std::vector<unsigned char> makeTextChunk(const char* keyword,
+                                                const std::string& text) {
+  std::vector<unsigned char> data;
+  appendBytes(data, keyword, strlen(keyword));
+  data.push_back(0); /* null separator */
+  appendBytes(data, text.data(), text.size());
+  return makeChunk("tEXt", data.empty() ? 0 : &data[0], data.size());
+}
+
+static std::vector<unsigned char> makeSrgbChunk(unsigned char intent) {
+  return makeChunk("sRGB", &intent, 1);
+}
+
+/* Parse the 128 byte ICC header + tag table + 7 required sRGB tags.
+The profile is built programmatically so no binary blob is needed. It follows
+ICC v2 (ICC.1:2001-04) and is structurally complete: profile header, tag count
+and the rXYZ/gXYZ/bXYZ/rTRC/gTRC/bTRC/Wtpt tag set required for an RGB
+profile. All three curves share one 'curv' tag and the three XYZ colorant
+tags are distinct but built from the same code path. */
+static std::vector<unsigned char> makeDefaultSrgbIccProfile() {
+  std::vector<unsigned char> p;
+
+  /* s15Fixed16 encoding of the sRGB primaries adapted to the D50 PCS
+  illuminant (ICC.1:2001-04, Table of sRGB color space tags). */
+  const unsigned D50_X = 0x0000F6D6; /* 0.9642 */
+  const unsigned D50_Y = 0x00010000; /* 1.0000 */
+  const unsigned D50_Z = 0x0000D32D; /* 0.8249 */
+  const unsigned RED_X = 0x00007BE5; /* 0.4850 */
+  const unsigned RED_Y = 0x00003FE5; /* 0.2499 */
+  const unsigned RED_Z = 0x0000083E; /* 0.0323 */
+  const unsigned GRN_X = 0x00003D8A; /* 0.2399 */
+  const unsigned GRN_Y = 0x00007F10; /* 0.4966 */
+  const unsigned GRN_Z = 0x000002F0; /* 0.0115 */
+  const unsigned BLU_X = 0x000007CC; /* 0.0305 */
+  const unsigned BLU_Y = 0x0000081C; /* 0.0317 */
+  const unsigned BLU_Z = 0x00006646; /* 0.3993 */
+
+  /* ---- 128 byte profile header (offsets per ICC.1:2001-04, 6.1) ---- */
+  put32(p, 0);                          /* 0:  profile size, patched below */
+  appendBytes(p, "lcml", 4);            /* 4:  preferred CMM */
+  put32(p, 0x02100000);                 /* 8:  version 2.1.0 */
+  appendBytes(p, "mntr", 4);            /* 12: device class = display */
+  appendBytes(p, "RGB ", 4);            /* 16: color space */
+  appendBytes(p, "XYZ ", 4);            /* 20: PCS */
+  for(size_t i = 0; i < 12; i++) p.push_back(0); /* 24: date/time, zero */
+  appendBytes(p, "acsp", 4);            /* 36: ICC signature */
+  appendBytes(p, "APPL", 4);            /* 40: primary platform */
+  put32(p, 0);                          /* 44: flags */
+  put32(p, 0);                          /* 48: device manufacturer */
+  put32(p, 0);                          /* 52: device model */
+  for(size_t i = 0; i < 8; i++) p.push_back(0); /* 56: device attributes */
+  put32(p, 0);                          /* 64: rendering intent = perceptual */
+  put32(p, D50_X);                      /* 68: PCS illuminant X (D50) */
+  put32(p, D50_Y);                      /* 72: PCS illuminant Y */
+  put32(p, D50_Z);                      /* 76: PCS illuminant Z */
+  put32(p, 0);                          /* 80: profile creator */
+  for(size_t i = 0; i < 16; i++) p.push_back(0); /* 84: reserved */
+  for(size_t i = 0; i < 28; i++) p.push_back(0); /* 100: profile ID/md5, zero */
+  if(p.size() != 128) return std::vector<unsigned char>(); /* internal check */
+
+  /* ---- tag table ---- */
+  const unsigned tag_count = 7;
+  put32(p, tag_count);
+  const size_t table_size = 4 + (size_t)tag_count * 12;
+  const size_t tags_start = 128 + table_size;
+
+  /* curv tag: type 'curv', 4 reserved bytes, count 0 means identity TRC. */
+  const size_t curv_size = 12;
+  /* XYZ tag: type 'XYZ ', 4 reserved, then one XYZ triple (20 bytes). */
+  const size_t xyz_size = 20;
+
+  /* Tag offsets relative to the start of the profile. All TRCs share curv. */
+  const size_t off_rxyz = tags_start;
+  const size_t off_gxyz = off_rxyz + xyz_size;
+  const size_t off_bxyz = off_gxyz + xyz_size;
+  const size_t off_wtpt = off_bxyz + xyz_size;
+  const size_t off_curv = off_wtpt + xyz_size;
+
+  struct Entry { const char name[4]; size_t offset; size_t size; };
+  const Entry entries[7] = {
+    { {'r','X','Y','Z'}, off_rxyz, xyz_size },
+    { {'g','X','Y','Z'}, off_gxyz, xyz_size },
+    { {'b','X','Y','Z'}, off_bxyz, xyz_size },
+    { {'r','T','R','C'}, off_curv, curv_size },
+    { {'g','T','R','C'}, off_curv, curv_size },
+    { {'b','T','R','C'}, off_curv, curv_size },
+    { {'w','t','p','t'}, off_wtpt, xyz_size }
+  };
+  for(size_t i = 0; i < 7; i++) {
+    appendBytes(p, entries[i].name, 4);
+    put32(p, (unsigned)entries[i].offset);
+    put32(p, (unsigned)entries[i].size);
+  }
+
+  /* ---- tag data ---- */
+  /* One XYZ tag: type signature + reserved + X,Y,Z s15Fixed16. */
+  struct XYZ { unsigned x, y, z; };
+  const XYZ triples[4] = {
+    { RED_X, RED_Y, RED_Z },
+    { GRN_X, GRN_Y, GRN_Z },
+    { BLU_X, BLU_Y, BLU_Z },
+    { D50_X, D50_Y, D50_Z } /* white point */
+  };
+  for(size_t i = 0; i < 4; i++) {
+    appendBytes(p, "XYZ ", 4);
+    put32(p, 0);
+    put32(p, triples[i].x);
+    put32(p, triples[i].y);
+    put32(p, triples[i].z);
+  }
+  /* Identity curve shared by the three TRC tags. */
+  appendBytes(p, "curv", 4);
+  put32(p, 0); /* reserved */
+  put32(p, 0); /* 0 entries = identity function */
+
+  /* Patch total profile size in the header. */
+  p[0] = (unsigned char)((p.size() >> 24) & 0xff);
+  p[1] = (unsigned char)((p.size() >> 16) & 0xff);
+  p[2] = (unsigned char)((p.size() >>  8) & 0xff);
+  p[3] = (unsigned char)( p.size()        & 0xff);
+  return p;
+}
+
+static std::vector<unsigned char> makeIccpChunk() {
+  std::vector<unsigned char> profile = makeDefaultSrgbIccProfile();
+  if(profile.empty()) return std::vector<unsigned char>(); /* internal build error */
+
+  unsigned char* compressed = 0;
+  size_t compressed_size = 0;
+  unsigned error = lodepng_zlib_compress(&compressed, &compressed_size,
+                                          profile.empty() ? 0 : &profile[0],
+                                          profile.size(),
+                                          &lodepng_default_compress_settings);
+  if(error) {
+    lodepng_free(compressed);
+    return std::vector<unsigned char>();
+  }
+
+  std::vector<unsigned char> data;
+  appendBytes(data, ICC_PROFILE_NAME, strlen(ICC_PROFILE_NAME));
+  data.push_back(0); /* profile name null terminator */
+  data.push_back(0); /* compression method 0 (zlib) */
+  appendBytes(data, compressed, compressed_size);
+  lodepng_free(compressed);
+
+  return makeChunk("iCCP", data.empty() ? 0 : &data[0], data.size());
+}
+
+/* Walk the chunks of a PNG. Returns 0 on success or a lodepng error code:
+27/28 for truncated/bad signature, 63 for an oversized chunk, 57 for bad CRC. */
+static unsigned parseChunks(const std::vector<unsigned char>& png,
+                            std::vector<Chunk>& chunks) {
+  static const unsigned char PNG_SIGNATURE[8] =
+    {137, 80, 78, 71, 13, 10, 26, 10};
+  if(png.size() < 8) return 27;
+  if(memcmp(&png[0], PNG_SIGNATURE, 8) != 0) return 28;
+
+  size_t pos = 8;
+  while(pos < png.size()) {
+    if(png.size() - pos < 12) return 27;
+    unsigned length = lodepng_chunk_length(&png[pos]);
+    if((size_t)length > png.size() - pos - 12) return 63;
+    Chunk chunk;
+    chunk.type.assign((const char*)&png[pos + 4], 4);
+    chunk.raw.assign(png.begin() + pos, png.begin() + pos + 12 + (size_t)length);
+    if(lodepng_chunk_check_crc(&png[pos])) return 57;
+    chunks.push_back(chunk);
+    pos += 12 + (size_t)length;
+  }
+  return 0;
+}
+
+static bool isTextType(const std::string& type) {
+  return type == "tEXt" || type == "zTXt" || type == "iTXt";
+}
+
+/* Extract the keyword from a tEXt/zTXt chunk (up to its null byte). */
+static std::string textKeyword(const Chunk& chunk) {
+  const std::vector<unsigned char>& raw = chunk.raw;
+  size_t start = 8; /* skip length and type */
+  size_t end = start;
+  while(end < raw.size() && raw[end] != 0) end++;
+  return std::string((const char*)&raw[start], end - start);
+}
+
+static std::string toDec(unsigned value) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%u", value);
+  return std::string(buf);
+}
+
+/* Read-only inspection: recognizes what is missing and fills the UpgradeReport
+with the defaults that would be applied. The PNG bytes are never modified. */
+unsigned inspectPng(const std::vector<unsigned char>& png, UpgradeReport& info) {
+  /* Reset every field first: callers may reuse one report object, and none of
+  the early error returns below may leave stale values behind. */
+  info.input_version = 0;
+  info.output_version = 0;
+  info.had_srgb = false;
+  info.had_iccp = false;
+  info.had_text = false;
+  info.had_version_chunk = false;
+  info.added_srgb = false;
+  info.added_iccp = false;
+  info.added_text = false;
+  info.upgraded = false;
+  info.report.clear();
+
+  std::vector<Chunk> chunks;
+  unsigned error = parseChunks(png, chunks);
+  if(error) return error;
+
+  bool have_ihdr = false, have_idat = false, have_iend = false;
+  bool have_srgb = false, have_iccp = false, have_text = false;
+  bool have_version = false;
+  unsigned version = PNG_VERSION_LEGACY;
+  bool version_seen_twice = false;
+
+  for(size_t i = 0; i < chunks.size(); i++) {
+    const Chunk& chunk = chunks[i];
+    if(chunk.type == "IHDR") have_ihdr = true;
+    else if(chunk.type == "IDAT") have_idat = true;
+    else if(chunk.type == "IEND") have_iend = true;
+    else if(chunk.type == "sRGB") have_srgb = true;
+    else if(chunk.type == "iCCP") have_iccp = true;
+    else if(isTextType(chunk.type)) {
+      have_text = true;
+      if(chunk.type == "tEXt" && textKeyword(chunk) == VERSION_KEYWORD) {
+        if(have_version) version_seen_twice = true;
+        have_version = true;
+        const std::vector<unsigned char>& raw = chunk.raw;
+        /* raw is length(4)+type(4)+data+CRC(4); the text runs from after
+        the keyword and its null byte up to, but not including, the CRC. */
+        size_t start = 8 + strlen(VERSION_KEYWORD) + 1;
+        size_t end_text = raw.size() >= 4 ? raw.size() - 4 : raw.size();
+        std::string text;
+        if(start < end_text) text.assign((const char*)&raw[start], end_text - start);
+        /* Every digit must be a decimal digit for the version to be valid. */
+        if(text.empty()) return 69;
+        for(size_t j = 0; j < text.size(); j++) {
+          if(text[j] < '0' || text[j] > '9') return 69;
+        }
+        unsigned parsed = 0;
+        for(size_t j = 0; j < text.size(); j++) {
+          unsigned digit = (unsigned)(text[j] - '0');
+          if(parsed > 429496729u ||
+             (parsed == 429496729u && digit > 5)) {
+            return ERR_VERSION_TOO_NEW; /* would overflow 32 bit */
+          }
+          parsed = parsed * 10 + digit;
+        }
+        version = parsed;
+      }
+    }
+  }
+
+  if(!have_ihdr || !have_idat || !have_iend) return 28; /* not a valid PNG */
+  if(version_seen_twice) return 69;
+  if(version > PNG_VERSION_CURRENT) return ERR_VERSION_TOO_NEW;
+
+  info.input_version = version;
+  info.output_version = PNG_VERSION_CURRENT;
+  info.had_srgb = have_srgb;
+  info.had_iccp = have_iccp;
+  info.had_text = have_text;
+  info.had_version_chunk = have_version;
+  info.added_srgb = !have_srgb;
+  info.added_iccp = !have_iccp;
+  /* The layer always (re)writes the two bookkeeping text chunks. */
+  info.added_text = !have_version;
+  info.upgraded = (version < PNG_VERSION_CURRENT) ||
+                  info.added_srgb || info.added_iccp;
+  info.report.clear();
+  return 0;
+}
+
+/* Rebuild the file: keep every original chunk except stale bookkeeping text
+chunks, then insert sRGB/iCCP directly before the first IDAT and append the
+Version/UpgradeReport tEXt chunks before IEND. */
+static unsigned rebuild(const std::vector<Chunk>& chunks,
+                        const UpgradeReport& info,
+                        std::vector<unsigned char>& out) {
+  static const unsigned char PNG_SIGNATURE[8] =
+    {137, 80, 78, 71, 13, 10, 26, 10};
+  appendBytes(out, PNG_SIGNATURE, 8);
+
+  std::vector<unsigned char> srgb_chunk, iccp_chunk, version_chunk, report_chunk;
+  if(info.added_srgb) srgb_chunk = makeSrgbChunk(DEFAULT_SRGB_INTENT);
+  if(info.added_iccp) {
+    iccp_chunk = makeIccpChunk();
+    if(iccp_chunk.empty()) return 83; /* alloc/compress failure */
+  }
+  version_chunk = makeTextChunk(VERSION_KEYWORD, toDec(info.output_version));
+  std::string report_text;
+  for(size_t i = 0; i < info.report.size(); i++) {
+    if(i) report_text += ";";
+    report_text += info.report[i];
+  }
+  report_chunk = makeTextChunk(REPORT_KEYWORD, report_text);
+
+  bool inserted = false; /* defaults inserted before the first IDAT */
+  bool wrote_bookkeeping = false;
+  for(size_t i = 0; i < chunks.size(); i++) {
+    const Chunk& chunk = chunks[i];
+
+    /* Drop old bookkeeping chunks, they are regenerated below. */
+    if(chunk.type == "tEXt" &&
+       (textKeyword(chunk) == VERSION_KEYWORD ||
+        textKeyword(chunk) == REPORT_KEYWORD)) {
+      continue;
+    }
+
+    if(!inserted && chunk.type == "IDAT") {
+      if(info.added_srgb) appendBytes(out, srgb_chunk);
+      if(info.added_iccp) appendBytes(out, iccp_chunk);
+      inserted = true;
+    }
+
+    if(chunk.type == "IEND") {
+      appendBytes(out, version_chunk);
+      appendBytes(out, report_chunk);
+      wrote_bookkeeping = true;
+    }
+    appendBytes(out, chunk.raw);
+  }
+
+  if(!inserted || !wrote_bookkeeping) return 28; /* structurally invalid input */
+  return 0;
+}
+
+/* Inspect, fill defaults for everything that is missing, and write the file
+back at the current version. On failure out is left empty and a lodepng error
+code is returned; no partially upgraded file is produced. */
+unsigned upgradePng(const std::vector<unsigned char>& png,
+                    std::vector<unsigned char>& out,
+                    UpgradeReport& info) {
+  out.clear();
+  std::vector<Chunk> chunks;
+  unsigned error = parseChunks(png, chunks);
+  if(error) return error;
+  error = inspectPng(png, info);
+  if(error) return error;
+
+  info.report.clear();
+  info.report.push_back(std::string("input-version=") + toDec(info.input_version));
+  if(info.added_srgb) {
+    info.report.push_back("added-sRGB(intent=0)");
+  } else {
+    info.report.push_back("kept-sRGB");
+  }
+  if(info.added_iccp) {
+    info.report.push_back(std::string("added-iCCP(name=") + ICC_PROFILE_NAME + ")");
+  } else {
+    info.report.push_back("kept-iCCP");
+  }
+  if(!info.had_text) {
+    info.report.push_back("added-text-defaults");
+  }
+  info.report.push_back(std::string("output-version=") + toDec(info.output_version));
+
+  error = rebuild(chunks, info, out);
+  if(error) {
+    out.clear();
+    return error;
+  }
+
+  /* The output must itself pass inspection at the current version. */
+  UpgradeReport check;
+  error = inspectPng(out, check);
+  if(error || check.input_version != PNG_VERSION_CURRENT ||
+     !check.had_srgb || !check.had_iccp) {
+    out.clear();
+    return error ? error : 69;
+  }
+  return 0;
+}
+
+} // namespace compat
 
 } // namespace lodepng
