@@ -217,6 +217,29 @@ unsigned lodepng_encode32(unsigned char** out, size_t* outsize,
 unsigned lodepng_encode24(unsigned char** out, size_t* outsize,
                           const unsigned char* image, unsigned w, unsigned h);
 
+/*
+Encodes an indexed-color PNG (PNG color type 3) from a palette and index data.
+
+palette: palette colors as RGBA quartets, so 4 * palettesize bytes, in RGBARGBA... order
+palettesize: number of colors in the palette, must be between 1 and 256
+image: raw index data, exactly one unsigned char index per pixel (w * h bytes);
+       every index must be smaller than palettesize
+w, h: width and height of the image in pixels
+
+The smallest valid bit depth (1, 2, 4 or 8 bits) that can hold palettesize is
+used. A PLTE chunk is always written. A tRNS chunk is written only when at least
+one palette color has an alpha value different from 255; when every color is
+fully opaque no tRNS chunk is written.
+
+All indices are checked before any output is produced. If an index is out of
+bounds, the function returns error 82 and writes nothing (*out stays NULL and
+*outsize stays 0), so no partial PNG file can result. The output buffer must be
+freed with lodepng_free after usage.
+*/
+unsigned lodepng_encode_palette(unsigned char** out, size_t* outsize,
+                                const unsigned char* image, unsigned w, unsigned h,
+                                const unsigned char* palette, unsigned palettesize);
+
 #ifdef LODEPNG_COMPILE_DISK
 /*
 Converts raw pixel data into a PNG file on disk.

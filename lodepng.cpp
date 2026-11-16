@@ -6882,6 +6882,89 @@ unsigned lodepng_encode24(unsigned char** out, size_t* outsize, const unsigned c
   return lodepng_encode_memory(out, outsize, image, w, h, LCT_RGB, 8);
 }
 
+/*Encodes an indexed-color (color type 3) PNG from a palette and 1 byte per
+pixel index data. The palette is given as RGBA quartets (palettesize colors,
+must be between 1 and 256). Every index is validated against palettesize before
+any PNG output is produced: an out of bounds index makes this function fail with
+error 82 and leaves *out and *outsize untouched (no partially written file).
+The smallest bit depth that can hold the palette size (1, 2, 4 or 8 bits) is
+chosen. A PLTE chunk is always written; a tRNS chunk is only written when at
+least one palette color has an alpha value other than 255.*/
+unsigned lodepng_encode_palette(unsigned char** out, size_t* outsize,
+                                const unsigned char* image, unsigned w, unsigned h,
+                                const unsigned char* palette, unsigned palettesize) {
+  LodePNGState state;
+  unsigned char* packed = 0;
+  unsigned bitdepth;
+  unsigned i;
+  unsigned error = 0;
+  size_t numpixels, p;
+
+  /*provide proper output values in case an error happens*/
+  *out = 0;
+  *outsize = 0;
+
+  if(palettesize < 1 || palettesize > 256) return 68; /*invalid palette size, it is only allowed to be 1-256*/
+
+  /*validate every index before doing any allocation or producing output, so that
+  an out of bounds index can never result in a partially written PNG*/
+  numpixels = (size_t)w * (size_t)h;
+  for(p = 0; p != numpixels; ++p) {
+    if(image[p] >= palettesize) return 82; /*index out of bounds*/
+  }
+
+  /*smallest PNG palette bit depth able to hold all palette entries*/
+  if(palettesize <= 2) bitdepth = 1;
+  else if(palettesize <= 4) bitdepth = 2;
+  else if(palettesize <= 16) bitdepth = 4;
+  else bitdepth = 8;
+
+  lodepng_state_init(&state);
+  state.encoder.auto_convert = 0; /*the output PNG must be color type 3 exactly*/
+  state.info_png.color.colortype = LCT_PALETTE;
+  state.info_png.color.bitdepth = bitdepth;
+  state.info_raw.colortype = LCT_PALETTE;
+  state.info_raw.bitdepth = bitdepth;
+
+  for(i = 0; i != palettesize; ++i) {
+    error = lodepng_palette_add(&state.info_png.color,
+                                palette[i * 4 + 0], palette[i * 4 + 1],
+                                palette[i * 4 + 2], palette[i * 4 + 3]);
+    if(error) goto cleanup;
+    error = lodepng_palette_add(&state.info_raw,
+                                palette[i * 4 + 0], palette[i * 4 + 1],
+                                palette[i * 4 + 2], palette[i * 4 + 3]);
+    if(error) goto cleanup;
+  }
+
+  if(bitdepth == 8) {
+    /*indices already are one byte each, they can be passed directly*/
+    error = lodepng_encode(out, outsize, image, w, h, &state);
+  } else {
+    /*pack the one-byte indices into the chosen sub-byte bit depth*/
+    size_t packedsize = lodepng_get_raw_size(w, h, &state.info_raw);
+    packed = (unsigned char*)lodepng_malloc(packedsize);
+    if(!packed) {
+      error = 83; /*memory allocation failed*/
+      goto cleanup;
+    }
+    lodepng_memset(packed, 0, packedsize);
+    for(p = 0; p != numpixels; ++p) addColorBits(packed, p, bitdepth, image[p]);
+    error = lodepng_encode(out, outsize, packed, w, h, &state);
+  }
+
+cleanup:
+  lodepng_free(packed);
+  lodepng_state_cleanup(&state);
+  if(error) {
+    /*make sure no partial output is handed to the caller on failure*/
+    lodepng_free(*out);
+    *out = 0;
+    *outsize = 0;
+  }
+  return error;
+}
+
 #ifdef LODEPNG_COMPILE_DISK
 unsigned lodepng_encode_file(const char* filename, const unsigned char* image, unsigned w, unsigned h,
                              LodePNGColorType colortype, unsigned bitdepth) {
