@@ -324,6 +324,46 @@ static char* alloc_string_sized(const char* in, size_t insize) {
 static char* alloc_string(const char* in) {
   return alloc_string_sized(in, lodepng_strlen(in));
 }
+
+/*
+Checks that a text chunk keyword is valid according to the PNG specification: 1 to 79
+characters, only printable Latin-1 characters (character codes 32-126 and 161-255), no
+control characters (such as a newline, which would break the null terminated
+representation), and no leading, trailing or consecutive spaces. This is checked both
+when filling in the info and when writing the chunks, so that invalid keys are rejected
+instead of producing an invalid PNG.
+Returns 0 if the key is valid, 89 for an invalid length (the pre-existing error code
+for that), or 124 for a keyword of valid length with disallowed characters.
+*/
+static unsigned checkTextKeyword(const char* key) {
+  size_t i, length = 0;
+  if(!key) return 89;
+  length = lodepng_strlen(key);
+  if(length < 1 || length > 79) return 89;
+  for(i = 0; i != length; ++i) {
+    unsigned char c = (unsigned char)key[i];
+    if(c < 32 || (c > 126 && c < 161)) return 124; /*not a printable Latin-1 char*/
+    if(c == 32 && (i == 0 || i + 1 == length || key[i + 1] == 32)) return 124;
+  }
+  return 0;
+}
+
+/*
+Checks that a language tag is valid for the iTXt chunk. The PNG specification stores it
+as a null terminated ASCII string; RFC 1766 language tags (e.g. "zh-CN") are ASCII, and
+for interoperability with tags using other scripts it must still not contain null or
+control characters. Any length is allowed, including empty (unknown language).
+Returns 0 if valid, 124 if the tag contains a disallowed character.
+*/
+static unsigned checkTextLangtag(const char* langtag) {
+  size_t i;
+  if(!langtag) return 124;
+  for(i = 0; langtag[i] != 0; ++i) {
+    unsigned char c = (unsigned char)langtag[i];
+    if(c < 32) return 124; /*control character*/
+  }
+  return 0;
+}
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 #endif /*LODEPNG_COMPILE_PNG*/
 
@@ -3184,13 +3224,17 @@ static void LodePNGText_cleanup(LodePNGInfo* info) {
   lodepng_free(info->text_strings);
 }
 
+static unsigned lodepng_add_text_sized(LodePNGInfo* info, const char* key, const char* str, size_t size);
+
 static unsigned LodePNGText_copy(LodePNGInfo* dest, const LodePNGInfo* source) {
   size_t i = 0;
   dest->text_keys = NULL;
   dest->text_strings = NULL;
   dest->text_num = 0;
   for(i = 0; i != source->text_num; ++i) {
-    CERROR_TRY_RETURN(lodepng_add_text(dest, source->text_keys[i], source->text_strings[i]));
+    /*copy without keyword validation: this may propagate texts of any existing PNG*/
+    CERROR_TRY_RETURN(lodepng_add_text_sized(dest, source->text_keys[i], source->text_strings[i],
+                                             lodepng_strlen(source->text_strings[i])));
   }
   return 0;
 }
@@ -3213,6 +3257,7 @@ static unsigned lodepng_add_text_sized(LodePNGInfo* info, const char* key, const
 }
 
 unsigned lodepng_add_text(LodePNGInfo* info, const char* key, const char* str) {
+  CERROR_TRY_RETURN(checkTextKeyword(key));
   return lodepng_add_text_sized(info, key, str, lodepng_strlen(str));
 }
 
@@ -3246,6 +3291,9 @@ static void LodePNGIText_cleanup(LodePNGInfo* info) {
   lodepng_free(info->itext_strings);
 }
 
+static unsigned lodepng_add_itext_sized(LodePNGInfo* info, const char* key, const char* langtag,
+                                        const char* transkey, const char* str, size_t size);
+
 static unsigned LodePNGIText_copy(LodePNGInfo* dest, const LodePNGInfo* source) {
   size_t i = 0;
   dest->itext_keys = NULL;
@@ -3254,8 +3302,10 @@ static unsigned LodePNGIText_copy(LodePNGInfo* dest, const LodePNGInfo* source) 
   dest->itext_strings = NULL;
   dest->itext_num = 0;
   for(i = 0; i != source->itext_num; ++i) {
-    CERROR_TRY_RETURN(lodepng_add_itext(dest, source->itext_keys[i], source->itext_langtags[i],
-                                        source->itext_transkeys[i], source->itext_strings[i]));
+    /*copy without keyword validation: this may propagate texts of any existing PNG*/
+    CERROR_TRY_RETURN(lodepng_add_itext_sized(dest, source->itext_keys[i], source->itext_langtags[i],
+                                              source->itext_transkeys[i], source->itext_strings[i],
+                                              lodepng_strlen(source->itext_strings[i])));
   }
   return 0;
 }
@@ -3292,6 +3342,8 @@ static unsigned lodepng_add_itext_sized(LodePNGInfo* info, const char* key, cons
 
 unsigned lodepng_add_itext(LodePNGInfo* info, const char* key, const char* langtag,
                            const char* transkey, const char* str) {
+  CERROR_TRY_RETURN(checkTextKeyword(key));
+  CERROR_TRY_RETURN(checkTextLangtag(langtag));
   return lodepng_add_itext_sized(info, key, langtag, transkey, str, lodepng_strlen(str));
 }
 
@@ -4916,7 +4968,9 @@ static unsigned readChunk_tEXt(LodePNGInfo* info, const unsigned char* data, siz
     lodepng_memcpy(str, data + string2_begin, length);
     str[length] = 0;
 
-    error = lodepng_add_text(info, key, str);
+    /*use the sized variant: the decoder stays lenient about keyword characters,
+    like it already is about other non-conforming chunk contents*/
+    error = lodepng_add_text_sized(info, key, str, lodepng_strlen(str));
 
     break;
   }
@@ -5798,6 +5852,7 @@ static unsigned addChunk_tEXt(ucvector* out, const char* keyword, const char* te
   size_t keysize = lodepng_strlen(keyword), textsize = lodepng_strlen(textstring);
   size_t size = keysize + 1 + textsize;
   if(keysize < 1 || keysize > 79) return 89; /*error: invalid keyword size*/
+  CERROR_TRY_RETURN(checkTextKeyword(keyword));
   CERROR_TRY_RETURN(lodepng_chunk_init(&chunk, out, size, "tEXt"));
   lodepng_memcpy(chunk + 8, keyword, keysize);
   chunk[8 + keysize] = 0; /*null termination char*/
@@ -5815,6 +5870,7 @@ static unsigned addChunk_zTXt(ucvector* out, const char* keyword, const char* te
   size_t textsize = lodepng_strlen(textstring);
   size_t keysize = lodepng_strlen(keyword);
   if(keysize < 1 || keysize > 79) return 89; /*error: invalid keyword size*/
+  CERROR_TRY_RETURN(checkTextKeyword(keyword));
 
   error = zlib_compress(&compressed, &compressedsize,
                         (const unsigned char*)textstring, textsize, zlibsettings);
@@ -5844,6 +5900,8 @@ static unsigned addChunk_iTXt(ucvector* out, unsigned compress, const char* keyw
   size_t keysize = lodepng_strlen(keyword), langsize = lodepng_strlen(langtag), transsize = lodepng_strlen(transkey);
 
   if(keysize < 1 || keysize > 79) return 89; /*error: invalid keyword size*/
+  CERROR_TRY_RETURN(checkTextKeyword(keyword));
+  CERROR_TRY_RETURN(checkTextLangtag(langtag));
 
   if(compress) {
     error = zlib_compress(&compressed, &compressedsize,
@@ -7055,6 +7113,7 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "text chunk keyword contains a character not allowed by the PNG specification";
   }
   return "unknown error code";
 }
