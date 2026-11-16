@@ -247,6 +247,86 @@ unsigned lodepng_encode24_file(const char* filename,
 #endif /*LODEPNG_COMPILE_ENCODER*/
 
 
+#if defined(LODEPNG_COMPILE_DECODER) || defined(LODEPNG_COMPILE_ENCODER)
+/* ////////////////////////////////////////////////////////////////////////// */
+/* APNG: animated PNG (multi-frame) encoding and decoding.                  */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*Per-frame metadata of an APNG animation.*/
+typedef struct LodePNGAPNGFrameInfo {
+  /*frame delay in seconds is delay_num / delay_den. delay_den must be nonzero.*/
+  unsigned short delay_num;
+  unsigned short delay_den;
+  /*dispose op: how to treat the canvas after rendering this frame:
+  0 = APNG_DISPOSE_OP_NONE (leave as is),
+  1 = APNG_DISPOSE_OP_BACKGROUND (clear to transparent),
+  2 = APNG_DISPOSE_OP_PREVIOUS (restore to before this frame)*/
+  unsigned char dispose_op;
+  /*blend op: how to composite this frame onto the canvas:
+  0 = APNG_BLEND_OP_SOURCE (overwrite), 1 = APNG_BLEND_OP_OVER (alpha blend)*/
+  unsigned char blend_op;
+} LodePNGAPNGFrameInfo;
+
+/*Initializes an APNG frame info to default values: delay 1/10s, dispose none, blend source.*/
+void lodepng_apng_frame_info_init(LodePNGAPNGFrameInfo* info);
+
+/*Frees the memory allocated by lodepng_decode32_apng: each frame buffer, the
+frames array itself and the frameinfo array. Safe to call with NULL pointers.*/
+void lodepng_apng_free(unsigned char** frames, LodePNGAPNGFrameInfo* frameinfo, unsigned numframes);
+
+#ifdef LODEPNG_COMPILE_DECODER
+/*
+Decodes all frames of an APNG (animated PNG) image from memory to 32-bit RGBA.
+If the input is a regular single-frame PNG (no acTL chunk), it is decoded as an
+animation with a single frame and default frame info.
+frames: Output parameter. Pointer to an array of numframes buffers, each
+        w * h * 4 bytes of RGBA pixel data at the full canvas size. Frames are
+        the raw frame data as stored in the file (not composited with previous
+        frames); pixels outside a frame's fcTL rectangle are 0. Free the result
+        with lodepng_apng_free.
+numframes: Output parameter. The amount of decoded frames.
+w, h: Output parameters. The canvas size in pixels.
+frameinfo: Output parameter. Array of numframes per-frame metadata (delay,
+           dispose op, blend op). Freed by lodepng_apng_free.
+numloops: Output parameter. Amount of times to loop the animation, 0 = forever.
+in: Memory buffer with the PNG/APNG file.
+insize: Size of the in buffer.
+Return value: LodePNG error code (0 means no error).
+*/
+unsigned lodepng_decode32_apng(unsigned char*** frames, unsigned* numframes,
+                               unsigned* w, unsigned* h,
+                               LodePNGAPNGFrameInfo** frameinfo, unsigned* numloops,
+                               const unsigned char* in, size_t insize);
+#endif /*LODEPNG_COMPILE_DECODER*/
+
+#ifdef LODEPNG_COMPILE_ENCODER
+/*
+Encodes an APNG (animated PNG) image in memory from 32-bit RGBA frames.
+Each frame is written as a full-canvas frame (fcTL rectangle equal to w * h).
+The first frame is stored as the PNG default image (IDAT), so decoders without
+APNG support show the first frame.
+Special case: if numframes is 1, this behaves exactly as lodepng_encode32 and
+outputs a regular single-frame PNG without any APNG chunks.
+out: Output parameter. Pointer to buffer that will contain the APNG data.
+     Must be freed after usage with free(*out).
+outsize: Output parameter. Pointer to the size in bytes of the out buffer.
+frames: Array of numframes buffers, each w * h * 4 bytes of RGBA pixel data.
+numframes: Amount of frames. Must be at least 1 (error 124 otherwise).
+w, h: Canvas size of the animation in pixels.
+frameinfo: Array of numframes per-frame metadata (delay, dispose op, blend op),
+           or NULL to use defaults for all frames. delay_den must be nonzero
+           (error 125), dispose_op <= 2 and blend_op <= 1 (error 126).
+numloops: Amount of times to loop the animation, 0 = loop forever.
+Return value: LodePNG error code (0 means no error).
+*/
+unsigned lodepng_encode32_apng(unsigned char** out, size_t* outsize,
+                               const unsigned char* const* frames, unsigned numframes,
+                               unsigned w, unsigned h,
+                               const LodePNGAPNGFrameInfo* frameinfo, unsigned numloops);
+#endif /*LODEPNG_COMPILE_ENCODER*/
+#endif /*defined(LODEPNG_COMPILE_DECODER) || defined(LODEPNG_COMPILE_ENCODER)*/
+
+
 #ifdef LODEPNG_COMPILE_CPP
 namespace lodepng {
 #ifdef LODEPNG_COMPILE_DECODER
@@ -270,6 +350,14 @@ unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h,
                 const std::string& filename,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
 #endif /* LODEPNG_COMPILE_DISK */
+/*Same as lodepng_decode32_apng, but decodes to std::vectors. Each frame is
+w * h * 4 bytes of 32-bit RGBA pixel data at the full canvas size.*/
+unsigned decode_apng(std::vector<std::vector<unsigned char> >& frames, unsigned& w, unsigned& h,
+                     std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned& numloops,
+                     const unsigned char* in, size_t insize);
+unsigned decode_apng(std::vector<std::vector<unsigned char> >& frames, unsigned& w, unsigned& h,
+                     std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned& numloops,
+                     const std::vector<unsigned char>& in);
 #endif /* LODEPNG_COMPILE_DECODER */
 
 #ifdef LODEPNG_COMPILE_ENCODER
@@ -298,6 +386,13 @@ unsigned encode(const std::string& filename,
                 const std::vector<unsigned char>& in, unsigned w, unsigned h,
                 LodePNGColorType colortype = LCT_RGBA, unsigned bitdepth = 8);
 #endif /* LODEPNG_COMPILE_DISK */
+/*Same as lodepng_encode32_apng, but with std::vectors. Each frame in frames
+must be w * h * 4 bytes of 32-bit RGBA pixel data. frameinfo must either be
+empty (defaults are used for all frames) or have the same size as frames.*/
+unsigned encode_apng(std::vector<unsigned char>& out,
+                     const std::vector<std::vector<unsigned char> >& frames,
+                     unsigned w, unsigned h,
+                     const std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned numloops);
 #endif /* LODEPNG_COMPILE_ENCODER */
 } /* namespace lodepng */
 #endif /*LODEPNG_COMPILE_CPP*/

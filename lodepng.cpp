@@ -5623,6 +5623,244 @@ unsigned lodepng_decode24_file(unsigned char** out, unsigned* w, unsigned* h, co
 }
 #endif /*LODEPNG_COMPILE_DISK*/
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / APNG Decoder                                                           / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*writes the 8-byte PNG signature to out. Same as writeSignature of the encoder,
+but defined here so the APNG decoder also works in decoder-only builds.*/
+static unsigned apng_write_signature(ucvector* out) {
+  size_t pos = out->size;
+  const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+  if(lodepng_addofls(out->size, 8) || !ucvector_resize(out, out->size + 8)) return 83; /*alloc fail*/
+  lodepng_memcpy(out->data + pos, signature, 8);
+  return 0;
+}
+
+/*appends data to a ucvector. Returns 0 on success, 83 on alloc failure, 77 on overflow.*/
+static unsigned apng_append(ucvector* out, const unsigned char* data, size_t size) {
+  size_t pos = out->size;
+  if(lodepng_addofls(out->size, size) || !ucvector_resize(out, out->size + size)) return 83; /*alloc fail*/
+  lodepng_memcpy(out->data + pos, data, size);
+  return 0;
+}
+
+unsigned lodepng_decode32_apng(unsigned char*** frames, unsigned* numframes,
+                               unsigned* w, unsigned* h,
+                               LodePNGAPNGFrameInfo** frameinfo, unsigned* numloops,
+                               const unsigned char* in, size_t insize) {
+  unsigned error = 0;
+  const unsigned char* chunk;
+  const unsigned char* end;
+  unsigned char ihdr[13];
+  unsigned cw = 0, ch = 0; /*canvas size from IHDR*/
+  unsigned plays = 0;
+  int have_actl = 0;
+  unsigned nframes = 0;
+  unsigned i;
+  unsigned cur = 0; /*index of the frame currently being filled*/
+  int have_fctl = 0;
+  unsigned char** out_frames = 0;
+  LodePNGAPNGFrameInfo* out_info = 0;
+  unsigned* fx = 0;
+  unsigned* fy = 0;
+  unsigned* fw = 0;
+  unsigned* fh = 0;
+  ucvector* fdata = 0;
+  size_t canvas_size = 0;
+
+  /*safe output values in case error happens*/
+  *frames = 0;
+  *numframes = 0;
+  *w = 0;
+  *h = 0;
+  *frameinfo = 0;
+  *numloops = 0;
+
+  if(insize < 8) return 27;
+  {
+    const unsigned char signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+    for(i = 0; i < 8; i++) if(in[i] != signature[i]) return 28;
+  }
+
+  end = in + insize;
+  chunk = in + 8;
+  if((size_t)(end - chunk) < 12 || !lodepng_chunk_type_equals(chunk, "IHDR")) return 29;
+  if(lodepng_chunk_length(chunk) != 13) return 94; /*IHDR must be 13 bytes*/
+  lodepng_memcpy(ihdr, chunk + 8, 13);
+  cw = lodepng_read32bitInt(ihdr + 0);
+  ch = lodepng_read32bitInt(ihdr + 4);
+
+  /*first pass: read acTL and count the fcTL chunks*/
+  chunk = lodepng_chunk_next_const(chunk, end);
+  while(chunk < end && (size_t)(end - chunk) >= 8) {
+    if(lodepng_chunk_type_equals(chunk, "acTL")) {
+      if(lodepng_chunk_length(chunk) != 8) return 127;
+      have_actl = 1;
+      nframes = lodepng_read32bitInt(chunk + 8);
+      plays = lodepng_read32bitInt(chunk + 12);
+    } else if(lodepng_chunk_type_equals(chunk, "IEND")) {
+      break;
+    }
+    chunk = lodepng_chunk_next_const(chunk, end);
+  }
+
+  if(!have_actl) {
+    /*not an APNG: decode as a single-frame animation with default frame info*/
+    unsigned char* img = 0;
+    error = lodepng_decode32(&img, w, h, in, insize);
+    if(error) return error;
+    out_frames = (unsigned char**)lodepng_malloc(sizeof(unsigned char*));
+    out_info = (LodePNGAPNGFrameInfo*)lodepng_malloc(sizeof(LodePNGAPNGFrameInfo));
+    if(!out_frames || !out_info) {
+      lodepng_free(out_frames);
+      lodepng_free(out_info);
+      lodepng_free(img);
+      *w = 0;
+      *h = 0;
+      return 83; /*alloc fail*/
+    }
+    out_frames[0] = img;
+    lodepng_apng_frame_info_init(out_info);
+    *frames = out_frames;
+    *frameinfo = out_info;
+    *numframes = 1;
+    *numloops = 0;
+    return 0;
+  }
+
+  if(nframes == 0) return 124; /*acTL claims 0 frames*/
+
+  fx = (unsigned*)lodepng_malloc(nframes * sizeof(unsigned));
+  fy = (unsigned*)lodepng_malloc(nframes * sizeof(unsigned));
+  fw = (unsigned*)lodepng_malloc(nframes * sizeof(unsigned));
+  fh = (unsigned*)lodepng_malloc(nframes * sizeof(unsigned));
+  fdata = (ucvector*)lodepng_malloc(nframes * sizeof(ucvector));
+  out_info = (LodePNGAPNGFrameInfo*)lodepng_malloc(nframes * sizeof(LodePNGAPNGFrameInfo));
+  out_frames = (unsigned char**)lodepng_malloc(nframes * sizeof(unsigned char*));
+  if(!fx || !fy || !fw || !fh || !fdata || !out_info || !out_frames) {
+    error = 83; /*alloc fail*/
+    goto cleanup;
+  }
+  for(i = 0; i < nframes; i++) {
+    fdata[i] = ucvector_init(NULL, 0);
+    out_frames[i] = 0;
+  }
+
+  /*second pass: read fcTL metadata and collect the compressed data of each frame*/
+  chunk = lodepng_chunk_next_const(in + 8, end);
+  while(chunk < end && (size_t)(end - chunk) >= 8) {
+    unsigned length = lodepng_chunk_length(chunk);
+    const unsigned char* data = chunk + 8;
+    if(lodepng_chunk_type_equals(chunk, "fcTL")) {
+      unsigned x, y, fw_, fh_;
+      if(length != 26) { error = 127; goto cleanup; }
+      if(cur >= nframes) { error = 127; goto cleanup; }
+      fw_ = lodepng_read32bitInt(data + 4);
+      fh_ = lodepng_read32bitInt(data + 8);
+      x = lodepng_read32bitInt(data + 12);
+      y = lodepng_read32bitInt(data + 16);
+      if(data[24] > 2 || data[25] > 1) { error = 126; goto cleanup; }
+      if(fw_ == 0 || fh_ == 0) { error = 127; goto cleanup; }
+      if(x > cw || fw_ > cw - x || y > ch || fh_ > ch - y) { error = 127; goto cleanup; }
+      fw[cur] = fw_;
+      fh[cur] = fh_;
+      fx[cur] = x;
+      fy[cur] = y;
+      out_info[cur].delay_num = (unsigned short)((data[20] << 8) | data[21]);
+      out_info[cur].delay_den = (unsigned short)((data[22] << 8) | data[23]);
+      if(out_info[cur].delay_den == 0) out_info[cur].delay_den = 100; /*APNG spec: 0 means 100*/
+      out_info[cur].dispose_op = data[24];
+      out_info[cur].blend_op = data[25];
+      have_fctl = 1;
+      cur++;
+    } else if(lodepng_chunk_type_equals(chunk, "IDAT")) {
+      /*IDAT holds the default image, which is frame 0 of the animation*/
+      if(!have_fctl || cur != 1) { error = 127; goto cleanup; }
+      error = apng_append(&fdata[0], data, length);
+      if(error) goto cleanup;
+    } else if(lodepng_chunk_type_equals(chunk, "fdAT")) {
+      if(!have_fctl || cur < 2) { error = 127; goto cleanup; }
+      if(length < 4) { error = 127; goto cleanup; }
+      error = apng_append(&fdata[cur - 1], data + 4, length - 4);
+      if(error) goto cleanup;
+    } else if(lodepng_chunk_type_equals(chunk, "IEND")) {
+      break;
+    }
+    chunk = lodepng_chunk_next_const(chunk, end);
+  }
+  if(cur != nframes) { error = 127; goto cleanup; } /*fcTL count differs from acTL*/
+
+  if(lodepng_mulofl(cw, ch, &canvas_size) || lodepng_mulofl(canvas_size, 4, &canvas_size)) {
+    error = 77; /*integer overflow*/
+    goto cleanup;
+  }
+
+  /*decode each frame: rebuild a standalone PNG from its compressed data, decode
+  it, then place its rectangle into a zero-initialized canvas-sized buffer*/
+  for(i = 0; i < nframes; i++) {
+    ucvector png = ucvector_init(NULL, 0);
+    unsigned char fihdr[13];
+    unsigned char* img = 0;
+    unsigned dw = 0, dh = 0;
+    unsigned row;
+    error = apng_write_signature(&png);
+    if(!error) {
+      lodepng_set32bitInt(fihdr + 0, fw[i]);
+      lodepng_set32bitInt(fihdr + 4, fh[i]);
+      lodepng_memcpy(fihdr + 8, ihdr + 8, 5); /*bitdepth, colortype, compression, filter, interlace*/
+      error = lodepng_chunk_createv(&png, 13, "IHDR", fihdr);
+    }
+    if(!error) error = lodepng_chunk_createv(&png, fdata[i].size, "IDAT", fdata[i].data);
+    if(!error) error = lodepng_chunk_createv(&png, 0, "IEND", 0);
+    if(!error) error = lodepng_decode32(&img, &dw, &dh, png.data, png.size);
+    lodepng_free(png.data);
+    if(error) goto cleanup;
+    if(dw != fw[i] || dh != fh[i]) {
+      lodepng_free(img);
+      error = 127;
+      goto cleanup;
+    }
+    out_frames[i] = (unsigned char*)lodepng_malloc(canvas_size ? canvas_size : 1);
+    if(!out_frames[i]) {
+      lodepng_free(img);
+      error = 83; /*alloc fail*/
+      goto cleanup;
+    }
+    lodepng_memset(out_frames[i], 0, canvas_size);
+    for(row = 0; row < fh[i]; row++) {
+      lodepng_memcpy(out_frames[i] + ((size_t)(fy[i] + row) * cw + fx[i]) * 4,
+                     img + (size_t)row * fw[i] * 4, (size_t)fw[i] * 4);
+    }
+    lodepng_free(img);
+  }
+
+  *frames = out_frames;
+  *numframes = nframes;
+  *w = cw;
+  *h = ch;
+  *frameinfo = out_info;
+  *numloops = plays;
+
+cleanup:
+  if(error) {
+    if(out_frames) {
+      for(i = 0; i < nframes; i++) lodepng_free(out_frames[i]);
+    }
+    lodepng_free(out_frames);
+    lodepng_free(out_info);
+  }
+  if(fdata) {
+    for(i = 0; i < nframes; i++) lodepng_free(fdata[i].data);
+  }
+  lodepng_free(fdata);
+  lodepng_free(fx);
+  lodepng_free(fy);
+  lodepng_free(fw);
+  lodepng_free(fh);
+  return error;
+}
+
 void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
   settings->color_convert = 1;
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
@@ -5640,6 +5878,22 @@ void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
 #endif /*LODEPNG_COMPILE_DECODER*/
 
 #if defined(LODEPNG_COMPILE_DECODER) || defined(LODEPNG_COMPILE_ENCODER)
+
+void lodepng_apng_frame_info_init(LodePNGAPNGFrameInfo* info) {
+  info->delay_num = 1;
+  info->delay_den = 10;
+  info->dispose_op = 0; /*APNG_DISPOSE_OP_NONE*/
+  info->blend_op = 0; /*APNG_BLEND_OP_SOURCE*/
+}
+
+void lodepng_apng_free(unsigned char** frames, LodePNGAPNGFrameInfo* frameinfo, unsigned numframes) {
+  unsigned i;
+  if(frames) {
+    for(i = 0; i < numframes; i++) lodepng_free(frames[i]);
+    lodepng_free(frames);
+  }
+  lodepng_free(frameinfo);
+}
 
 void lodepng_state_init(LodePNGState* state) {
 #ifdef LODEPNG_COMPILE_DECODER
@@ -6902,6 +7156,129 @@ unsigned lodepng_encode24_file(const char* filename, const unsigned char* image,
 }
 #endif /*LODEPNG_COMPILE_DISK*/
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* / APNG Encoder                                                           / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+static unsigned addChunk_acTL(ucvector* out, unsigned numframes, unsigned numloops) {
+  unsigned char data[8];
+  lodepng_set32bitInt(data + 0, numframes);
+  lodepng_set32bitInt(data + 4, numloops);
+  return lodepng_chunk_createv(out, 8, "acTL", data);
+}
+
+static unsigned addChunk_fcTL(ucvector* out, unsigned seq, unsigned w, unsigned h,
+                              unsigned x, unsigned y, const LodePNGAPNGFrameInfo* info) {
+  unsigned char data[26];
+  lodepng_set32bitInt(data + 0, seq);
+  lodepng_set32bitInt(data + 4, w);
+  lodepng_set32bitInt(data + 8, h);
+  lodepng_set32bitInt(data + 12, x);
+  lodepng_set32bitInt(data + 16, y);
+  data[20] = (unsigned char)(info->delay_num >> 8);
+  data[21] = (unsigned char)(info->delay_num & 255);
+  data[22] = (unsigned char)(info->delay_den >> 8);
+  data[23] = (unsigned char)(info->delay_den & 255);
+  data[24] = info->dispose_op;
+  data[25] = info->blend_op;
+  return lodepng_chunk_createv(out, 26, "fcTL", data);
+}
+
+unsigned lodepng_encode32_apng(unsigned char** out, size_t* outsize,
+                               const unsigned char* const* frames, unsigned numframes,
+                               unsigned w, unsigned h,
+                               const LodePNGAPNGFrameInfo* frameinfo, unsigned numloops) {
+  unsigned error = 0;
+  unsigned i;
+  unsigned seq = 0;
+  ucvector outv = ucvector_init(NULL, 0);
+  LodePNGAPNGFrameInfo default_info;
+
+  /*safe output values in case error happens*/
+  *out = 0;
+  *outsize = 0;
+
+  if(numframes == 0) return 124;
+  if(!frames) return 127;
+  /*single frame: identical to a regular lodepng_encode32 call, no APNG chunks*/
+  if(numframes == 1) return lodepng_encode32(out, outsize, frames[0], w, h);
+
+  lodepng_apng_frame_info_init(&default_info);
+  for(i = 0; i < numframes; i++) {
+    const LodePNGAPNGFrameInfo* info = frameinfo ? &frameinfo[i] : &default_info;
+    if(!frames[i]) return 127;
+    if(info->delay_den == 0) return 125;
+    if(info->dispose_op > 2 || info->blend_op > 1) return 126;
+  }
+
+  error = writeSignature(&outv);
+  for(i = 0; i < numframes && !error; i++) {
+    unsigned char* png = 0;
+    size_t pngsize = 0;
+    const unsigned char* chunk;
+    const unsigned char* end;
+    const LodePNGAPNGFrameInfo* info = frameinfo ? &frameinfo[i] : &default_info;
+    /*encode the frame as a standalone PNG, then reuse its IHDR/IDAT data. The
+    color type is forced to 32-bit RGBA: auto-conversion to palette would need
+    a PLTE chunk, which is global in PNG and cannot be per-frame.*/
+    {
+      LodePNGState state;
+      lodepng_state_init(&state);
+      state.info_raw.colortype = LCT_RGBA;
+      state.info_raw.bitdepth = 8;
+      state.info_png.color.colortype = LCT_RGBA;
+      state.info_png.color.bitdepth = 8;
+      state.encoder.auto_convert = 0;
+      error = lodepng_encode(&png, &pngsize, frames[i], w, h, &state);
+      lodepng_state_cleanup(&state);
+    }
+    if(error) break;
+    chunk = png + 8;
+    end = png + pngsize;
+    if((size_t)(end - chunk) < 12 || !lodepng_chunk_type_equals(chunk, "IHDR")) {
+      lodepng_free(png);
+      error = 127;
+      break;
+    }
+    if(i == 0) {
+      error = lodepng_chunk_createv(&outv, 13, "IHDR", chunk + 8);
+      if(!error) error = addChunk_acTL(&outv, numframes, numloops);
+    }
+    if(!error) error = addChunk_fcTL(&outv, seq++, w, h, 0, 0, info);
+    /*copy the IDAT data of this frame: as IDAT for frame 0, as fdAT otherwise*/
+    while(!error && chunk < end && (size_t)(end - chunk) >= 8) {
+      if(lodepng_chunk_type_equals(chunk, "IDAT")) {
+        unsigned length = lodepng_chunk_length(chunk);
+        if(i == 0) {
+          error = lodepng_chunk_createv(&outv, length, "IDAT", chunk + 8);
+        } else {
+          unsigned char* fdatchunk;
+          error = lodepng_chunk_init(&fdatchunk, &outv, (size_t)length + 4, "fdAT");
+          if(!error) {
+            lodepng_set32bitInt(fdatchunk + 8, seq++);
+            lodepng_memcpy(fdatchunk + 12, chunk + 8, length);
+            lodepng_chunk_generate_crc(fdatchunk);
+          }
+        }
+      } else if(lodepng_chunk_type_equals(chunk, "IEND")) {
+        break;
+      }
+      chunk = lodepng_chunk_next_const(chunk, end);
+    }
+    lodepng_free(png);
+  }
+  if(!error) error = addChunk_IEND(&outv);
+
+  if(error) {
+    lodepng_free(outv.data);
+    return error;
+  }
+  /*instead of cleaning the vector up, give it to the output*/
+  *out = outv.data;
+  *outsize = outv.size;
+  return 0;
+}
+
 void lodepng_encoder_settings_init(LodePNGEncoderSettings* settings) {
   lodepng_compress_settings_init(&settings->zlibsettings);
   settings->filter_palette_zero = 1;
@@ -7055,6 +7432,10 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "invalid APNG frame count: an animation must have at least 1 frame";
+    case 125: return "invalid APNG frame delay: delay denominator is zero";
+    case 126: return "invalid APNG dispose or blend op";
+    case 127: return "invalid APNG frame structure or data";
   }
   return "unknown error code";
 }
@@ -7210,6 +7591,34 @@ unsigned decode(std::vector<unsigned char>& out, unsigned& w, unsigned& h, const
 #endif /* LODEPNG_COMPILE_DECODER */
 #endif /* LODEPNG_COMPILE_DISK */
 
+#ifdef LODEPNG_COMPILE_DECODER
+unsigned decode_apng(std::vector<std::vector<unsigned char> >& frames, unsigned& w, unsigned& h,
+                     std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned& numloops,
+                     const unsigned char* in, size_t insize) {
+  unsigned char** fr = 0;
+  LodePNGAPNGFrameInfo* fi = 0;
+  unsigned n = 0;
+  unsigned i;
+  unsigned error = lodepng_decode32_apng(&fr, &n, &w, &h, &fi, &numloops, in, insize);
+  if(error) return error;
+  frames.clear();
+  frames.resize(n);
+  frameinfo.clear();
+  frameinfo.insert(frameinfo.end(), fi, fi + n);
+  for(i = 0; i < n; i++) {
+    frames[i].insert(frames[i].end(), fr[i], fr[i] + (size_t)w * h * 4);
+  }
+  lodepng_apng_free(fr, fi, n);
+  return 0;
+}
+
+unsigned decode_apng(std::vector<std::vector<unsigned char> >& frames, unsigned& w, unsigned& h,
+                     std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned& numloops,
+                     const std::vector<unsigned char>& in) {
+  return decode_apng(frames, w, h, frameinfo, numloops, in.empty() ? 0 : &in[0], in.size());
+}
+#endif /* LODEPNG_COMPILE_DECODER */
+
 #ifdef LODEPNG_COMPILE_ENCODER
 unsigned encode(std::vector<unsigned char>& out, const unsigned char* in, unsigned w, unsigned h,
                 LodePNGColorType colortype, unsigned bitdepth) {
@@ -7267,6 +7676,30 @@ unsigned encode(const std::string& filename,
   return encode(filename, in.empty() ? 0 : &in[0], w, h, colortype, bitdepth);
 }
 #endif /* LODEPNG_COMPILE_DISK */
+
+unsigned encode_apng(std::vector<unsigned char>& out,
+                     const std::vector<std::vector<unsigned char> >& frames,
+                     unsigned w, unsigned h,
+                     const std::vector<LodePNGAPNGFrameInfo>& frameinfo, unsigned numloops) {
+  unsigned char* buffer = 0;
+  size_t buffersize = 0;
+  unsigned i;
+  unsigned n = (unsigned)frames.size();
+  std::vector<const unsigned char*> ptrs(n);
+  unsigned error;
+  if(!frameinfo.empty() && frameinfo.size() != frames.size()) return 127;
+  for(i = 0; i < n; i++) {
+    if(frames[i].size() < (size_t)w * h * 4) return 84;
+    ptrs[i] = frames[i].empty() ? 0 : &frames[i][0];
+  }
+  error = lodepng_encode32_apng(&buffer, &buffersize, n ? &ptrs[0] : 0, n, w, h,
+                                frameinfo.empty() ? 0 : &frameinfo[0], numloops);
+  if(buffer) {
+    out.insert(out.end(), buffer, &buffer[buffersize]);
+    lodepng_free(buffer);
+  }
+  return error;
+}
 #endif /* LODEPNG_COMPILE_ENCODER */
 #endif /* LODEPNG_COMPILE_PNG */
 } /* namespace lodepng */
