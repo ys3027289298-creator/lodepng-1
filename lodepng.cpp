@@ -7055,10 +7055,355 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 200: return "scan pipeline: result pointer is null";
+    case 201: return "scan pipeline: width or height is zero";
+    case 202: return "scan pipeline: unsupported input color type or bit depth";
+    case 203: return "scan pipeline: invalid quantile parameters";
+    case 204: return "scan pipeline: stretch output min must be below max";
+    case 205: return "scan pipeline: histogram levels must be between 2 and 256";
+    case 206: return "scan pipeline: unknown pipeline flag bit";
+    case 207: return "scan pipeline: palette size must be between 2 and 256";
+    case 208: return "scan pipeline: input buffer too small for given dimensions";
   }
   return "unknown error code";
 }
 #endif /*LODEPNG_COMPILE_ERROR_TEXT*/
+
+/* ////////////////////////////////////////////////////////////////////////// */
+/* // Scan enhancement pipeline: quantile clip, linear stretch, histogram // */
+/* // equalization and optional indexed output. Fixed order, each stage can // */
+/* // be switched independently. Pure C, only uses the public LodePNG API  // */
+/* // below, so the original encode/decode path is untouched.              // */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+#ifdef LODEPNG_COMPILE_PNG
+
+#include <time.h> /* clock, CLOCKS_PER_SEC for the elapsed_ms measurement */
+
+#define LSP_CLIP    1u
+#define LSP_STRETCH 2u
+#define LSP_HISTEQ  4u
+#define LSP_INDEX   8u
+#define LSP_ALL     (LSP_CLIP | LSP_STRETCH | LSP_HISTEQ | LSP_INDEX)
+#define LSP_KNOWN   LSP_ALL
+
+typedef struct LodePNGScanStats {
+  unsigned quant_lo, quant_hi, qlo, qhi;
+  double mean, variance;
+  unsigned levels;
+} LodePNGScanStats;
+
+typedef struct LodePNGScanResult {
+  unsigned char* rgb;
+  size_t rgb_size;
+  unsigned char* indices;
+  size_t indices_size;
+  unsigned char palette[256][4];
+  unsigned palette_size;
+  unsigned char* rgb_png;
+  size_t rgb_png_size;
+  unsigned char* idx_png;
+  size_t idx_png_size;
+  LodePNGScanStats stats[5];
+  double elapsed_ms;
+} LodePNGScanResult;
+
+static unsigned scan_quantile(const unsigned long* hist, size_t n,
+                              unsigned permille) {
+  size_t target = (n * (size_t)permille) / 1000u;
+  size_t cumul = 0;
+  int v;
+  if(target >= n) target = n - 1;
+  for(v = 0; v < 256; v++) {
+    cumul += (size_t)hist[v];
+    if(cumul > target) return (unsigned)v;
+  }
+  return 255;
+}
+
+static void scan_compute_stats(LodePNGScanStats* st,
+                               const unsigned char* gray, size_t n,
+                               unsigned qlo, unsigned qhi) {
+  unsigned long hist[256];
+  unsigned long sum = 0;
+  double mean, acc, d;
+  unsigned levels = 0;
+  int v;
+  size_t i;
+  for(v = 0; v < 256; v++) hist[v] = 0;
+  for(i = 0; i < n; i++) {
+    hist[gray[i]]++;
+    sum += (unsigned long)gray[i];
+  }
+  mean = (double)sum / (double)n;
+  acc = 0.0;
+  for(v = 0; v < 256; v++) {
+    if(hist[v]) levels++;
+    d = (double)v - mean;
+    acc += (double)hist[v] * d * d;
+  }
+  st->qlo = qlo;
+  st->qhi = qhi;
+  st->quant_lo = scan_quantile(hist, n, qlo);
+  st->quant_hi = scan_quantile(hist, n, qhi);
+  st->mean = mean;
+  st->variance = acc / (double)n;
+  st->levels = levels;
+}
+
+static void scan_clip(unsigned char* gray, size_t n, unsigned lo,
+                      unsigned hi) {
+  size_t i;
+  for(i = 0; i < n; i++) {
+    if(gray[i] < lo) gray[i] = (unsigned char)lo;
+    if(gray[i] > hi) gray[i] = (unsigned char)hi;
+  }
+}
+
+static void scan_stretch(unsigned char* gray, size_t n, unsigned lo,
+                         unsigned hi, unsigned lo_out, unsigned hi_out) {
+  long span_in, span_out;
+  size_t i;
+  span_in = (long)hi - (long)lo;
+  span_out = (long)hi_out - (long)lo_out;
+  if(span_in <= 0) {
+    for(i = 0; i < n; i++) gray[i] = (unsigned char)lo_out;
+    return;
+  }
+  for(i = 0; i < n; i++) {
+    long x = (long)gray[i] - (long)lo;
+    long v;
+    if(x < 0) x = 0;
+    if(x > span_in) x = span_in;
+    v = (long)lo_out + (x * span_out) / span_in;
+    gray[i] = (unsigned char)v;
+  }
+}
+
+static void scan_histeq(unsigned char* gray, size_t n) {
+  unsigned long hist[256];
+  unsigned long cdf[256];
+  unsigned long cumul = 0;
+  unsigned long den;
+  int v, first = -1;
+  size_t i;
+  for(v = 0; v < 256; v++) hist[v] = 0;
+  for(i = 0; i < n; i++) hist[gray[i]]++;
+  for(v = 0; v < 256; v++) {
+    if(hist[v] && first < 0) first = v;
+    cumul += hist[v];
+    cdf[v] = cumul;
+  }
+  if(first < 0) return;
+  den = (unsigned long)n - cdf[first];
+  if(den == 0) return;
+  for(i = 0; i < n; i++) {
+    unsigned long num = cdf[gray[i]] - cdf[first];
+    gray[i] = (unsigned char)((num * 255ul) / den);
+  }
+}
+
+static unsigned scan_to_index(unsigned char value, unsigned palette_size) {
+  unsigned v = (unsigned)(((size_t)value * (size_t)(palette_size - 1)
+                           + 127ul) / 255ul);
+  if(v >= palette_size) v = palette_size - 1;
+  return v;
+}
+
+void lodepng_scan_result_cleanup(LodePNGScanResult* result) {
+  if(!result) return;
+  lodepng_free(result->rgb);
+  lodepng_free(result->indices);
+  lodepng_free(result->rgb_png);
+  lodepng_free(result->idx_png);
+  result->rgb = 0;
+  result->indices = 0;
+  result->rgb_png = 0;
+  result->idx_png = 0;
+  result->rgb_size = result->indices_size = 0;
+  result->rgb_png_size = result->idx_png_size = 0;
+}
+
+unsigned lodepng_scan_pipeline(LodePNGScanResult* result,
+                               const unsigned char* image, size_t image_size,
+                               unsigned width, unsigned height,
+                               LodePNGColorType colortype, unsigned bitdepth,
+                               unsigned flags,
+                               unsigned qlo, unsigned qhi,
+                               unsigned stretch_min, unsigned stretch_max,
+                               unsigned hist_levels, unsigned palette_size) {
+  size_t n, bytes_per_pixel, needed, i;
+  unsigned char* gray = 0;
+  unsigned char* quant_gray = 0;
+  unsigned char* rgb = 0;
+  unsigned char* indices = 0;
+  unsigned char* rgb_png = 0;
+  unsigned char* idx_png = 0;
+  size_t rgb_png_size = 0, idx_png_size = 0;
+  unsigned char channels;
+  unsigned low, high;
+  unsigned long hist[256];
+  clock_t start;
+  unsigned error = 0;
+
+  if(!result) return 200;
+  lodepng_scan_result_cleanup(result);
+
+  if(width == 0 || height == 0) return 201;
+  if(!((colortype == LCT_RGB || colortype == LCT_RGBA) && bitdepth == 8))
+    return 202;
+  channels = (unsigned char)(colortype == LCT_RGBA ? 4 : 3);
+
+  if(qlo > 1000 || qhi > 1000 || qlo >= qhi) return 203;
+  if(stretch_min >= stretch_max) return 204;
+  if(hist_levels < 2 || hist_levels > 256) return 205;
+  if(flags & ~LSP_KNOWN) return 206;
+  if((flags & LSP_INDEX) && (palette_size < 2 || palette_size > 256))
+    return 207;
+
+  if((size_t)width > (size_t)-1 / (size_t)height) return 208;
+  n = (size_t)width * (size_t)height;
+  if(n > (size_t)-1 / (size_t)channels) return 208;
+  bytes_per_pixel = (size_t)channels;
+  if(n > (size_t)-1 / bytes_per_pixel) return 208;
+  needed = n * bytes_per_pixel;
+  if(!image || image_size < needed) return 208;
+
+  start = clock();
+
+  gray = (unsigned char*)lodepng_malloc(n);
+  rgb = (unsigned char*)lodepng_malloc(n * 3);
+  if(!gray || !rgb) {
+    lodepng_free(gray);
+    lodepng_free(rgb);
+    return 83;
+  }
+
+  for(i = 0; i < n; i++) {
+    unsigned char r = image[i * bytes_per_pixel];
+    unsigned char g = image[i * bytes_per_pixel + 1];
+    unsigned char b = image[i * bytes_per_pixel + 2];
+    gray[i] = (unsigned char)(((unsigned)r * 77u + (unsigned)g * 150u +
+                               (unsigned)b * 29u) >> 8);
+  }
+
+  for(i = 0; i < 256; i++) hist[i] = 0;
+  for(i = 0; i < n; i++) hist[gray[i]]++;
+  low = scan_quantile(hist, n, qlo);
+  high = scan_quantile(hist, n, qhi);
+
+  scan_compute_stats(&result->stats[0], gray, n, qlo, qhi);
+
+  if(flags & LSP_CLIP) scan_clip(gray, n, low, high);
+  scan_compute_stats(&result->stats[1], gray, n, qlo, qhi);
+
+  if(flags & LSP_STRETCH)
+    scan_stretch(gray, n, low, high, stretch_min, stretch_max);
+  scan_compute_stats(&result->stats[2], gray, n, qlo, qhi);
+
+  if(flags & LSP_HISTEQ) scan_histeq(gray, n);
+  scan_compute_stats(&result->stats[3], gray, n, qlo, qhi);
+
+  if(flags & LSP_INDEX) {
+    indices = (unsigned char*)lodepng_malloc(n);
+    quant_gray = (unsigned char*)lodepng_malloc(n);
+    if(!indices || !quant_gray) {
+      lodepng_free(gray);
+      lodepng_free(rgb);
+      lodepng_free(indices);
+      lodepng_free(quant_gray);
+      return 83;
+    }
+    for(i = 0; i < n; i++) {
+      unsigned v = scan_to_index(gray[i], palette_size);
+      indices[i] = (unsigned char)v;
+      quant_gray[i] =
+          (unsigned char)(((size_t)v * 255ul) / (size_t)(palette_size - 1));
+    }
+    scan_compute_stats(&result->stats[4], quant_gray, n, qlo, qhi);
+  } else {
+    result->stats[4] = result->stats[3];
+  }
+
+  for(i = 0; i < n; i++) {
+    rgb[i * 3] = gray[i];
+    rgb[i * 3 + 1] = gray[i];
+    rgb[i * 3 + 2] = gray[i];
+  }
+
+  {
+    LodePNGState rgb_state;
+    lodepng_state_init(&rgb_state);
+    /* force a true color (color type 2) PNG, no palette auto-conversion */
+    rgb_state.info_raw.colortype = LCT_RGB;
+    rgb_state.info_raw.bitdepth = 8;
+    rgb_state.info_png.color.colortype = LCT_RGB;
+    rgb_state.info_png.color.bitdepth = 8;
+    rgb_state.encoder.auto_convert = 0;
+    error = lodepng_encode(&rgb_png, &rgb_png_size, rgb, width, height,
+                           &rgb_state);
+    lodepng_state_cleanup(&rgb_state);
+  }
+  if(error) goto cleanup;
+
+  if(flags & LSP_INDEX) {
+    LodePNGState state;
+    unsigned p;
+    lodepng_state_init(&state);
+    state.info_png.color.colortype = LCT_PALETTE;
+    state.info_png.color.bitdepth = 8;
+    state.info_raw.colortype = LCT_PALETTE;
+    state.info_raw.bitdepth = 8;
+    state.encoder.auto_convert = 0;
+    for(p = 0; p < palette_size; p++) {
+      unsigned char level =
+          (unsigned char)(((size_t)p * 255ul) / (size_t)(palette_size - 1));
+      error = lodepng_palette_add(&state.info_png.color, level, level,
+                                  level, 255);
+      if(!error)
+        error = lodepng_palette_add(&state.info_raw, level, level,
+                                    level, 255);
+      if(error) break;
+      result->palette[p][0] = level;
+      result->palette[p][1] = level;
+      result->palette[p][2] = level;
+      result->palette[p][3] = 255;
+    }
+    if(!error)
+      error = lodepng_encode(&idx_png, &idx_png_size, indices, width,
+                             height, &state);
+    lodepng_state_cleanup(&state);
+    if(error) goto cleanup;
+    result->palette_size = palette_size;
+  }
+
+  result->elapsed_ms =
+      (double)(clock() - start) * 1000.0 / (double)CLOCKS_PER_SEC;
+
+  result->rgb = rgb;
+  result->rgb_size = n * 3;
+  result->rgb_png = rgb_png;
+  result->rgb_png_size = rgb_png_size;
+  if(flags & LSP_INDEX) {
+    result->indices = indices;
+    result->indices_size = n;
+    result->idx_png = idx_png;
+    result->idx_png_size = idx_png_size;
+  }
+
+cleanup:
+  lodepng_free(gray);
+  lodepng_free(quant_gray);
+  if(error) {
+    lodepng_free(rgb);
+    lodepng_free(indices);
+    lodepng_free(rgb_png);
+    lodepng_free(idx_png);
+  }
+  return error;
+}
+
+#endif /*LODEPNG_COMPILE_PNG*/
 
 /* ////////////////////////////////////////////////////////////////////////// */
 /* ////////////////////////////////////////////////////////////////////////// */
