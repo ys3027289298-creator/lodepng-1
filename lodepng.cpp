@@ -47,6 +47,41 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 const char* LODEPNG_VERSION_STRING = "20261102";
 
 /*
+Compile-time switch for the structured decode diagnostics.
+
+The diagnostics are an additive, opt-in debugging facility. They are off by
+default at runtime, and this whole section can be removed from the binary with
+-DLODEPNG_NO_COMPILE_DIAGNOSTICS. The public decode API and its pixel output are
+not affected by it.
+
+Because only lodepng.cpp may be changed in this variant, the declarations of the
+diagnostic functions (all defined further down in this file) are repeated here
+instead of being added to lodepng.h. Declare them the same way in the code that
+wants to use them:
+
+  void lodepng_diagnostics_set_enabled(int enable);
+  int  lodepng_diagnostics_get_enabled(void);
+  void lodepng_diagnostics_reset(void);
+  size_t lodepng_diagnostics_count(void);
+  unsigned lodepng_diagnostics_error_code(size_t index);
+  const char* lodepng_diagnostics_chunk_name(size_t index);
+  int lodepng_diagnostics_has_offset(size_t index);
+  size_t lodepng_diagnostics_offset(size_t index);
+  const char* lodepng_diagnostics_cause(size_t index);
+  const char* lodepng_diagnostics_suggestion(size_t index);
+  const char* lodepng_diagnostics_text(void);
+
+When enabled, every call to lodepng_decode (and the functions built on it)
+resets the list and scans the input file independently of the normal decode.
+All structural issues found are appended in order of their byte offset in the
+file. Decoding itself is untouched and produces exactly the same pixels and the
+same return code as with diagnostics disabled.
+*/
+#ifndef LODEPNG_NO_COMPILE_DIAGNOSTICS
+#define LODEPNG_COMPILE_DIAGNOSTICS
+#endif
+
+/*
 This source file is divided into the following large parts. The code sections
 with the "LODEPNG_COMPILE_" #defines divide this up further in an intermixed way.
 -Tools for C and common code for PNG and Zlib
@@ -4396,6 +4431,549 @@ static void Adam7_getpassvalues(unsigned passw[7], unsigned passh[7], size_t fil
 #ifdef LODEPNG_COMPILE_DECODER
 
 /* ////////////////////////////////////////////////////////////////////////// */
+/* / Decode diagnostics (optional, additive)                                / */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+Structured, opt-in diagnostics for badly formed PNG files. This is a separate
+read-only inspection pass over the input; the normal decode path below is not
+modified, so the decoded pixels and the returned error code are exactly the
+same whether diagnostics are enabled or not.
+
+Usage (declarations are repeated here because this variant may only modify
+lodepng.cpp; declare them the same way in your own code):
+
+  void lodepng_diagnostics_set_enabled(int enable);
+  int lodepng_diagnostics_get_enabled(void);
+  unsigned lodepng_diagnostics_scan(const unsigned char* in, size_t insize);
+  void lodepng_diagnostics_reset(void);
+  size_t lodepng_diagnostics_count(void);
+  unsigned lodepng_diagnostics_error_code(size_t index);
+  const char* lodepng_diagnostics_chunk_name(size_t index);
+  int lodepng_diagnostics_has_offset(size_t index);
+  size_t lodepng_diagnostics_offset(size_t index);
+  const char* lodepng_diagnostics_cause(size_t index);
+  const char* lodepng_diagnostics_suggestion(size_t index);
+  const char* lodepng_diagnostics_text(void);
+
+lodepng_decode (and the functions built on it) automatically resets and runs
+the scan when diagnostics are enabled, so the results are available right after
+a decode call. The scan can also be run directly with lodepng_diagnostics_scan.
+
+Offsets are 0-based byte offsets in the file. The error codes are the normal
+LodePNG codes where an equivalent exists (0 means no error); codes from 1000 up
+are diagnostics-only findings for broken files that the decoder itself tolerates
+or reports with a less specific code. The storage is a fixed-size static list,
+so this facility is not thread-safe; it is meant for debugging tools.
+*/
+
+#ifndef LODEPNG_NO_COMPILE_DIAGNOSTICS
+
+#define LODEPNG_DIAG_MAX_ENTRIES 32
+#define LODEPNG_DIAG_FIELD_SIZE 200
+#define LODEPNG_DIAG_TEXT_SIZE 16384
+
+typedef struct LodePngDiagEntry {
+  unsigned code;
+  char chunk[5];
+  int has_offset;
+  size_t offset;
+  char cause[LODEPNG_DIAG_FIELD_SIZE];
+  char suggestion[LODEPNG_DIAG_FIELD_SIZE];
+} LodePngDiagEntry;
+
+static LodePngDiagEntry lodepng_diag_entries[LODEPNG_DIAG_MAX_ENTRIES];
+static size_t lodepng_diag_count = 0;
+static size_t lodepng_diag_dropped = 0;
+static int lodepng_diag_enabled = 0;
+
+void lodepng_diagnostics_set_enabled(int enable) {
+  lodepng_diag_enabled = enable ? 1 : 0;
+}
+
+int lodepng_diagnostics_get_enabled(void) {
+  return lodepng_diag_enabled;
+}
+
+void lodepng_diagnostics_reset(void) {
+  lodepng_diag_count = 0;
+  lodepng_diag_dropped = 0;
+}
+
+size_t lodepng_diagnostics_count(void) {
+  return lodepng_diag_count;
+}
+
+static const LodePngDiagEntry* lodepng_diag_get(size_t index) {
+  if(index >= lodepng_diag_count) return 0;
+  return &lodepng_diag_entries[index];
+}
+
+unsigned lodepng_diagnostics_error_code(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->code : 0;
+}
+
+const char* lodepng_diagnostics_chunk_name(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->chunk : "";
+}
+
+int lodepng_diagnostics_has_offset(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->has_offset : 0;
+}
+
+size_t lodepng_diagnostics_offset(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->offset : 0;
+}
+
+const char* lodepng_diagnostics_cause(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->cause : "";
+}
+
+const char* lodepng_diagnostics_suggestion(size_t index) {
+  const LodePngDiagEntry* e = lodepng_diag_get(index);
+  return e ? e->suggestion : "";
+}
+
+/*small bounded string builder, to avoid depending on snprintf (ANSI C only)*/
+static void lodepng_diag_cat(char* buf, size_t bufsize, const char* s) {
+  size_t pos = 0, i = 0;
+  if(bufsize == 0) return;
+  while(pos + 1 < bufsize && buf[pos] != 0) ++pos;
+  while(s[i] != 0 && pos + 1 < bufsize) buf[pos++] = s[i++];
+  buf[pos] = 0;
+}
+
+static void lodepng_diag_cat_uint(char* buf, size_t bufsize, size_t value) {
+  char tmp[24];
+  size_t n = 0;
+  if(value == 0) {
+    lodepng_diag_cat(buf, bufsize, "0");
+    return;
+  }
+  while(value != 0 && n < sizeof(tmp)) {
+    tmp[n++] = (char)('0' + (value % 10));
+    value /= 10;
+  }
+  while(n != 0) {
+    char one[2];
+    one[0] = tmp[--n];
+    one[1] = 0;
+    lodepng_diag_cat(buf, bufsize, one);
+  }
+}
+
+#ifdef LODEPNG_COMPILE_CRC
+static void lodepng_diag_cat_hex8(char* buf, size_t bufsize, unsigned value) {
+  static const char hexchars[17] = "0123456789abcdef";
+  char tmp[9];
+  unsigned i;
+  for(i = 0; i != 8; ++i) tmp[i] = hexchars[(value >> (28u - 4u * i)) & 15u];
+  tmp[8] = 0;
+  lodepng_diag_cat(buf, bufsize, tmp);
+}
+#endif /*LODEPNG_COMPILE_CRC*/
+
+static void lodepng_diag_copy(char* dst, size_t dstsize, const char* src) {
+  size_t i = 0;
+  if(dstsize == 0) return;
+  while(src[i] != 0 && i + 1 < dstsize) {
+    dst[i] = src[i];
+    ++i;
+  }
+  dst[i] = 0;
+}
+
+/*store a chunk name, replacing bytes that are not printable ASCII*/
+static void lodepng_diag_chunk_name(char out[5], const unsigned char* chunk) {
+  unsigned i;
+  for(i = 0; i != 4; ++i) {
+    unsigned char c = chunk[4 + i];
+    out[i] = (c >= 32 && c < 127) ? (char)c : '?';
+  }
+  out[4] = 0;
+}
+
+static void lodepng_diag_add(unsigned code, const char* chunkname, int has_offset, size_t offset,
+                             const char* cause, const char* suggestion) {
+  LodePngDiagEntry* e;
+  if(lodepng_diag_count >= LODEPNG_DIAG_MAX_ENTRIES) {
+    ++lodepng_diag_dropped;
+    return;
+  }
+  e = &lodepng_diag_entries[lodepng_diag_count++];
+  e->code = code;
+  lodepng_diag_copy(e->chunk, sizeof(e->chunk), chunkname ? chunkname : "");
+  e->has_offset = has_offset;
+  e->offset = offset;
+  lodepng_diag_copy(e->cause, sizeof(e->cause), cause ? cause : "");
+  lodepng_diag_copy(e->suggestion, sizeof(e->suggestion), suggestion ? suggestion : "");
+}
+
+/*
+Scan the file and append one entry per structural problem, in order of the
+byte offset where the problem was detected. Never reads out of bounds and
+never modifies the input.
+*/
+static unsigned lodepng_diagnose(const unsigned char* in, size_t insize) {
+  size_t pos;
+  size_t iend_offset = 0;
+  unsigned seen_plte = 0, seen_idat = 0, seen_iend = 0, idat_closed = 0;
+  unsigned have_colortype = 0, truncated = 0;
+  unsigned colortype = 0;
+  char name[5];
+
+  lodepng_diagnostics_reset();
+
+  if(in == 0 || insize == 0) {
+    lodepng_diag_add(48, "", 0, 0,
+        "the input buffer is empty",
+        "the file may not exist or may be zero bytes long; check the path and the read result");
+    return lodepng_diag_count;
+  }
+  if(insize < 8) {
+    char cause[LODEPNG_DIAG_FIELD_SIZE];
+    cause[0] = 0;
+    lodepng_diag_cat(cause, sizeof(cause), "the file has only ");
+    lodepng_diag_cat_uint(cause, sizeof(cause), insize);
+    lodepng_diag_cat(cause, sizeof(cause), " bytes, shorter than the 8-byte PNG signature");
+    lodepng_diag_add(27, "", 0, 0, cause,
+        "the file is truncated or is not a PNG file; re-download or re-export it");
+    return lodepng_diag_count;
+  }
+  if(in[0] != 137 || in[1] != 80 || in[2] != 78 || in[3] != 71
+     || in[4] != 13 || in[5] != 10 || in[6] != 26 || in[7] != 10) {
+    lodepng_diag_add(28, "", 1, 0,
+        "the first 8 bytes are not the PNG signature (89 50 4E 47 0D 0A 1A 0A)",
+        "this is not a PNG file or its first bytes are corrupted; check the file type and source");
+    return lodepng_diag_count;
+  }
+  if(insize < 33) {
+    char cause[LODEPNG_DIAG_FIELD_SIZE];
+    cause[0] = 0;
+    lodepng_diag_cat(cause, sizeof(cause), "the file has only ");
+    lodepng_diag_cat_uint(cause, sizeof(cause), insize);
+    lodepng_diag_cat(cause, sizeof(cause), " bytes; a complete IHDR chunk needs 33 bytes");
+    lodepng_diag_add(27, "", 1, 0, cause,
+        "the file is truncated right after the signature; re-download or re-export it");
+    return lodepng_diag_count;
+  }
+
+  /*check the IHDR chunk at offset 8 and the image dimensions in it*/
+  {
+    size_t ihdrlen = (size_t)lodepng_chunk_length(in + 8);
+    int is_ihdr = lodepng_chunk_type_equals(in + 8, "IHDR") ? 1 : 0;
+    lodepng_diag_chunk_name(name, in + 8);
+    if(!is_ihdr) {
+      lodepng_diag_add(29, name, 1, 8,
+          "the first chunk after the signature is not IHDR",
+          "a PNG file must start with IHDR; the file is corrupted or is not a PNG");
+    } else if(ihdrlen != 13) {
+      char cause[LODEPNG_DIAG_FIELD_SIZE];
+      cause[0] = 0;
+      lodepng_diag_cat(cause, sizeof(cause), "the IHDR chunk declares a length of ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), ihdrlen);
+      lodepng_diag_cat(cause, sizeof(cause), " bytes instead of 13");
+      lodepng_diag_add(94, "IHDR", 1, 8, cause,
+          "the IHDR header is corrupted; the rest of the file cannot be interpreted reliably");
+    } else {
+      unsigned width = lodepng_read32bitInt(in + 16);
+      unsigned height = lodepng_read32bitInt(in + 20);
+      unsigned bitdepth = in[24];
+      unsigned ct = in[25];
+      unsigned err;
+      have_colortype = 1;
+      colortype = ct;
+
+      if(width == 0 || height == 0) {
+        char cause[LODEPNG_DIAG_FIELD_SIZE];
+        cause[0] = 0;
+        lodepng_diag_cat(cause, sizeof(cause), "width is ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), width);
+        lodepng_diag_cat(cause, sizeof(cause), " and height is ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), height);
+        lodepng_diag_cat(cause, sizeof(cause), ", but both must be nonzero");
+        lodepng_diag_add(93, "IHDR", 1, 16, cause,
+            "the image dimensions are invalid; fix the IHDR width/height fields or re-export the image");
+      }
+      if(width > 2147483647u || height > 2147483647u) {
+        char cause[LODEPNG_DIAG_FIELD_SIZE];
+        cause[0] = 0;
+        lodepng_diag_cat(cause, sizeof(cause), "width is ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), width);
+        lodepng_diag_cat(cause, sizeof(cause), " and height is ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), height);
+        lodepng_diag_cat(cause, sizeof(cause),
+            ", but PNG limits each dimension to 2147483647");
+        lodepng_diag_add(1009, "IHDR", 1, 16, cause,
+            "the width or height field is corrupted; the actual image is probably smaller");
+      }
+      err = checkColorValidity((LodePNGColorType)ct, bitdepth);
+      if(err) {
+        char cause[LODEPNG_DIAG_FIELD_SIZE];
+        cause[0] = 0;
+        lodepng_diag_cat(cause, sizeof(cause), "color type ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), ct);
+        lodepng_diag_cat(cause, sizeof(cause), " with bit depth ");
+        lodepng_diag_cat_uint(cause, sizeof(cause), bitdepth);
+        lodepng_diag_cat(cause, sizeof(cause), " is not a valid PNG combination");
+        lodepng_diag_add(err, "IHDR", 1, 25, cause,
+            "the IHDR color type or bit depth is corrupt; valid bit depths depend on the color type");
+      }
+      if(in[26] != 0) {
+        lodepng_diag_add(32, "IHDR", 1, 26,
+            "the IHDR compression method is not 0",
+            "PNG only defines compression method 0 (deflate); the header is corrupted");
+      }
+      if(in[27] != 0) {
+        lodepng_diag_add(33, "IHDR", 1, 27,
+            "the IHDR filter method is not 0",
+            "PNG only defines filter method 0; the header is corrupted");
+      }
+      if(in[28] > 1) {
+        lodepng_diag_add(34, "IHDR", 1, 28,
+            "the IHDR interlace method is larger than 1",
+            "PNG only defines interlace methods 0 and 1; the header is corrupted");
+      }
+    }
+  }
+
+  /*walk all chunks; every finding is appended in file order*/
+  pos = 8;
+  while(pos < insize) {
+    size_t len, available = insize - pos;
+    size_t total;
+    int is_ihdr, is_idat, is_plte, is_trns, is_iend;
+
+    if(available < 12) {
+      char cause[LODEPNG_DIAG_FIELD_SIZE];
+      cause[0] = 0;
+      lodepng_diag_cat(cause, sizeof(cause), "the file ends with ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), available);
+      lodepng_diag_cat(cause, sizeof(cause),
+          " bytes at offset ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), pos);
+      lodepng_diag_cat(cause, sizeof(cause),
+          ", too few for a 12-byte chunk header (length, type, CRC)");
+      lodepng_diag_add(30, "", 1, pos, cause,
+          "the file is truncated in the middle of a chunk header; re-download or re-export it");
+      truncated = 1;
+      break;
+    }
+
+    len = (size_t)lodepng_chunk_length(in + pos);
+    lodepng_diag_chunk_name(name, in + pos);
+    is_ihdr = lodepng_chunk_type_equals(in + pos, "IHDR") ? 1 : 0;
+    is_idat = lodepng_chunk_type_equals(in + pos, "IDAT") ? 1 : 0;
+    is_plte = lodepng_chunk_type_equals(in + pos, "PLTE") ? 1 : 0;
+    is_trns = lodepng_chunk_type_equals(in + pos, "tRNS") ? 1 : 0;
+    is_iend = lodepng_chunk_type_equals(in + pos, "IEND") ? 1 : 0;
+
+    if(len > 2147483647u) {
+      char cause[LODEPNG_DIAG_FIELD_SIZE];
+      cause[0] = 0;
+      lodepng_diag_cat(cause, sizeof(cause), "the chunk length field says ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), len);
+      lodepng_diag_cat(cause, sizeof(cause),
+          " bytes, more than the PNG maximum of 2147483647");
+      lodepng_diag_add(63, name, 1, pos, cause,
+          "the chunk length field is corrupted; the file cannot be walked further");
+      truncated = 1;
+      break;
+    }
+
+    total = len + 12;
+    if(total > available) {
+      char cause[LODEPNG_DIAG_FIELD_SIZE];
+      cause[0] = 0;
+      lodepng_diag_cat(cause, sizeof(cause), "chunk declares ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), len);
+      lodepng_diag_cat(cause, sizeof(cause),
+          " data bytes (");
+      lodepng_diag_cat_uint(cause, sizeof(cause), total);
+      lodepng_diag_cat(cause, sizeof(cause),
+          " bytes including header and CRC) but only ");
+      lodepng_diag_cat_uint(cause, sizeof(cause), available);
+      lodepng_diag_cat(cause, sizeof(cause), " bytes remain in the file");
+      lodepng_diag_add(64, name, 1, pos, cause,
+          "the file is truncated or this chunk's length field is corrupt; re-download the file");
+      truncated = 1;
+      break;
+    }
+
+    if(!lodepng_chunk_type_name_valid(in + pos)) {
+      lodepng_diag_add(121, name, 1, pos,
+          "the chunk type contains bytes that are not letters a-z or A-Z",
+          "the chunk type field is corrupted; only ASCII letters are allowed");
+    } else if(lodepng_chunk_reserved(in + pos)) {
+      lodepng_diag_add(122, name, 1, pos,
+          "the third character of the chunk type is lowercase, which is reserved",
+          "the chunk type field is corrupted or uses a reserved name; it must have an uppercase third letter");
+    }
+
+#ifdef LODEPNG_COMPILE_CRC
+    {
+      unsigned stored = lodepng_read32bitInt(in + pos + 8 + len);
+      unsigned computed = lodepng_crc32(in + pos + 4, len + 4);
+      if(stored != computed) {
+        char cause[LODEPNG_DIAG_FIELD_SIZE];
+        cause[0] = 0;
+        lodepng_diag_cat(cause, sizeof(cause), "stored CRC 0x");
+        lodepng_diag_cat_hex8(cause, sizeof(cause), stored);
+        lodepng_diag_cat(cause, sizeof(cause), " does not match the computed CRC 0x");
+        lodepng_diag_cat_hex8(cause, sizeof(cause), computed);
+        lodepng_diag_cat(cause, sizeof(cause), " over the chunk type and data");
+        lodepng_diag_add(57, name, 1, pos, cause,
+            "the chunk bytes were modified after encoding; re-export the PNG, or set decoder.ignore_crc=1 to decode anyway");
+      }
+    }
+#endif /*LODEPNG_COMPILE_CRC*/
+
+    /*chunk ordering rules of the PNG specification*/
+    if(pos == 8) {
+      if(is_iend) seen_iend = 1;
+    } else if(seen_iend) {
+      lodepng_diag_add(1003, name, 1, pos,
+          "a chunk appears after the IEND end-of-image chunk",
+          "bytes after IEND are ignored by decoders; re-export the file to remove the trailing chunk");
+    } else {
+      if(is_ihdr) {
+        lodepng_diag_add(1008, "IHDR", 1, pos,
+            "the file contains a second IHDR chunk",
+            "a PNG file must have exactly one IHDR chunk as its first chunk");
+      }
+      if(is_idat) {
+        if(idat_closed) {
+          lodepng_diag_add(1002, name, 1, pos,
+              "an IDAT chunk appears after another chunk interrupted the IDAT sequence",
+              "the PNG specification requires all IDAT chunks to be consecutive");
+        }
+        seen_idat = 1;
+      } else {
+        if(seen_idat) idat_closed = 1;
+        if(is_plte) {
+          if(seen_plte) {
+            lodepng_diag_add(1004, name, 1, pos,
+                "the file contains a second PLTE palette chunk",
+                "a PNG file may contain at most one PLTE chunk");
+          }
+          if(seen_idat) {
+            lodepng_diag_add(1001, name, 1, pos,
+                "the PLTE palette chunk appears after the first IDAT image data chunk",
+                "the PNG specification requires PLTE before IDAT; move the palette before the image data");
+          }
+          seen_plte = 1;
+        }
+        if(is_trns) {
+          if(seen_idat) {
+            lodepng_diag_add(1005, name, 1, pos,
+                "the tRNS transparency chunk appears after the first IDAT image data chunk",
+                "tRNS must come before IDAT so decoders know the transparency before the pixels");
+          } else if(have_colortype && colortype == (unsigned)LCT_PALETTE && !seen_plte) {
+            lodepng_diag_add(39, name, 1, pos,
+                "the tRNS chunk appears before the PLTE chunk of a palette image",
+                "PLTE must come before tRNS in a palette image");
+          }
+        }
+        if(is_iend) {
+          seen_iend = 1;
+          iend_offset = pos;
+        }
+      }
+    }
+
+    pos += total;
+  }
+
+  /*summary findings for a file that ended cleanly but is incomplete*/
+  if(!truncated) {
+    size_t last_offset = seen_iend ? iend_offset : insize;
+    if(!seen_idat) {
+      lodepng_diag_add(1006, "", 1, last_offset,
+          "the file contains no IDAT image data chunk",
+          "there are no pixels to decode; the image data is missing or was removed");
+    }
+    if(have_colortype && colortype == (unsigned)LCT_PALETTE && !seen_plte) {
+      lodepng_diag_add(106, "PLTE", 1, last_offset,
+          "the IHDR says the image uses color type 3 (palette) but no PLTE chunk is present",
+          "palette images need a PLTE chunk before IDAT; the file is incomplete or corrupted");
+    }
+    if(!seen_iend) {
+      lodepng_diag_add(1007, "", 1, insize,
+          "the file ends after its last chunk without an IEND end-of-image chunk",
+          "the file is truncated at a chunk boundary or IEND was removed; re-export the PNG");
+    }
+  }
+
+  /*findings above are collected per file region; sort them into file order so a
+  reader can walk them top-to-bottom through the file. Stable for equal offsets.*/
+  {
+    size_t a, b;
+    for(a = 1; a < lodepng_diag_count; ++a) {
+      LodePngDiagEntry tmp = lodepng_diag_entries[a];
+      b = a;
+      while(b > 0) {
+        const LodePngDiagEntry* prev = &lodepng_diag_entries[b - 1];
+        int prev_after_tmp = 0;
+        if(prev->has_offset && tmp.has_offset) prev_after_tmp = prev->offset > tmp.offset;
+        else if(prev->has_offset != tmp.has_offset) prev_after_tmp = tmp.has_offset; /*offset-less entries go last*/
+        if(!prev_after_tmp) break;
+        lodepng_diag_entries[b] = lodepng_diag_entries[b - 1];
+        --b;
+      }
+      lodepng_diag_entries[b] = tmp;
+    }
+  }
+
+  return lodepng_diag_count;
+}
+
+unsigned lodepng_diagnostics_scan(const unsigned char* in, size_t insize) {
+  return lodepng_diagnose(in, insize);
+}
+
+const char* lodepng_diagnostics_text(void) {
+  static char text[LODEPNG_DIAG_TEXT_SIZE];
+  size_t i;
+  text[0] = 0;
+  if(lodepng_diag_count == 0) {
+    lodepng_diag_cat(text, sizeof(text), "no diagnostics");
+    return text;
+  }
+  if(lodepng_diag_dropped) {
+    lodepng_diag_cat(text, sizeof(text), "note: ");
+    lodepng_diag_cat_uint(text, sizeof(text), lodepng_diag_dropped);
+    lodepng_diag_cat(text, sizeof(text), " further diagnostics were not stored (entry limit ");
+    lodepng_diag_cat_uint(text, sizeof(text), LODEPNG_DIAG_MAX_ENTRIES);
+    lodepng_diag_cat(text, sizeof(text), " reached)\n");
+  }
+  for(i = 0; i != lodepng_diag_count; ++i) {
+    const LodePngDiagEntry* e = &lodepng_diag_entries[i];
+    lodepng_diag_cat(text, sizeof(text), "diagnostic ");
+    lodepng_diag_cat_uint(text, sizeof(text), i + 1);
+    lodepng_diag_cat(text, sizeof(text), ": error ");
+    lodepng_diag_cat_uint(text, sizeof(text), e->code);
+    lodepng_diag_cat(text, sizeof(text), ", chunk \"");
+    lodepng_diag_cat(text, sizeof(text), e->chunk);
+    lodepng_diag_cat(text, sizeof(text), "\", offset ");
+    if(e->has_offset) lodepng_diag_cat_uint(text, sizeof(text), e->offset);
+    else lodepng_diag_cat(text, sizeof(text), "n/a");
+    lodepng_diag_cat(text, sizeof(text), ": ");
+    lodepng_diag_cat(text, sizeof(text), e->cause);
+    lodepng_diag_cat(text, sizeof(text), "; suggestion: ");
+    lodepng_diag_cat(text, sizeof(text), e->suggestion);
+    lodepng_diag_cat(text, sizeof(text), "\n");
+  }
+  return text;
+}
+
+#endif /*LODEPNG_NO_COMPILE_DIAGNOSTICS*/
+
+/* ////////////////////////////////////////////////////////////////////////// */
 /* / PNG Decoder                                                            / */
 /* ////////////////////////////////////////////////////////////////////////// */
 
@@ -5533,6 +6111,12 @@ unsigned lodepng_decode(unsigned char** out, unsigned* w, unsigned* h,
                         LodePNGState* state,
                         const unsigned char* in, size_t insize) {
   *out = 0;
+#ifdef LODEPNG_COMPILE_DIAGNOSTICS
+  /*diagnostics are a separate read-only pass; they don't affect the decode below.
+  When disabled, just clear stale results so a previous run can't be misread.*/
+  if(lodepng_diag_enabled) lodepng_diagnose(in, insize);
+  else lodepng_diagnostics_reset();
+#endif /*LODEPNG_COMPILE_DIAGNOSTICS*/
   decodeGeneric(out, w, h, state, in, insize);
   if(state->error) goto cleanup;
   if(!state->decoder.color_convert || lodepng_color_mode_equal(&state->info_raw, &state->info_png.color)) {
