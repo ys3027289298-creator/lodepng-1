@@ -252,6 +252,66 @@ unsigned convertFromXYZFloat(float* out, const float* in, unsigned w, unsigned h
                              const float whitepoint[3], unsigned rendering_intent);
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
+/*
+GIF decoding (GIF87a and GIF89a). This is a decoder only, there is no GIF encoder.
+It lives in lodepng_util, not in the core lodepng, so the PNG codec is unaffected.
+
+A GIF file contains a logical screen (the canvas) and one or more image frames.
+Each frame can have its own rectangle, local color table, interlacing, transparent
+color index and frame delay (from the graphic control extension). This decoder
+composites every frame onto the logical screen, honoring the disposal method of
+the previous frame, and returns the resulting full-canvas RGBA image per frame.
+
+The returned error codes are the GIF error codes 200-215 documented at
+gifErrorText below, disjoint from the PNG error codes of lodepng.
+
+Memory usage is bounded by: (num_frames + 2) * w * h * 4 bytes for the returned
+frames and the internal compositing canvas and its backup copy, plus w * h bytes
+for a per-frame index buffer, plus a fixed ~16KiB for the LZW dictionary tables,
+plus the size of the input buffer itself. Transient std::vector growth can add a
+factor of up to 2 on the largest of those buffers.
+*/
+struct GIFFrame {
+  std::vector<unsigned char> image; /* RGBA 8-bit, w * h * 4 bytes, full logical screen */
+  unsigned delay; /* frame delay in 1/100ths of a second, 0 if unspecified */
+};
+
+/*
+Decodes all frames of a GIF file.
+frames: output, one entry per image frame, in file order, already composited.
+w, h: output, size of the logical screen (same size for every frame).
+in, insize: the GIF file contents.
+Returns 0 on success, or a GIF error code (see gifErrorText).
+*/
+unsigned decodeGIF(std::vector<GIFFrame>& frames, unsigned& w, unsigned& h,
+                   const unsigned char* in, size_t insize);
+
+/* Same as above, but takes the input as a std::vector. */
+unsigned decodeGIF(std::vector<GIFFrame>& frames, unsigned& w, unsigned& h,
+                   const std::vector<unsigned char>& in);
+
+/*
+Returns an English text describing the GIF error code, or the PNG error text
+for codes below 200. The GIF error codes are:
+ 200: file too small to contain a GIF header
+ 201: invalid GIF signature (file does not start with "GIF")
+ 202: unsupported GIF version (only GIF87a and GIF89a are supported)
+ 203: unexpected end of data (file is truncated)
+ 204: logical screen has zero width or height
+ 205: too many pixels in the logical screen (safety limit)
+ 206: image has no color table (neither local nor global)
+ 207: invalid LZW minimum code size (must be in range 2..8)
+ 208: LZW stream error (invalid or out of range code)
+ 209: LZW stream ended without end-of-information code
+ 210: decoded pixel count does not match the frame rectangle
+ 211: the GIF contains no image frames
+ 212: invalid frame rectangle (empty or outside the logical screen)
+ 213: malformed graphic control extension
+ 214: color index out of range of the active color table
+ 215: unknown block type in the GIF stream
+*/
+const char* gifErrorText(unsigned code);
+
 } // namespace lodepng
 
 #endif /*LODEPNG_UTIL_H inclusion guard*/

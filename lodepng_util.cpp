@@ -1456,4 +1456,318 @@ unsigned convertFromSrgb(unsigned char* out, const unsigned char* in,
 
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* GIF decoding                                                               */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*Safety limit on the amount of pixels in the logical screen: 2^28 pixels is
+1GiB of RGBA per composited frame buffer.*/
+#define LODEPNG_GIF_MAX_PIXELS 268435456u
+
+/*Reads a 16-bit little endian value. in must have at least pos+2 bytes.*/
+static unsigned gifRead16(const unsigned char* in, size_t pos) {
+  return (unsigned)(in[pos]) | ((unsigned)(in[pos + 1]) << 8);
+}
+
+/*Reads a color table of 2^(size_exp+1) RGB entries into palette (3 bytes per
+entry). Returns 0 or GIF error 203.*/
+static unsigned gifReadColorTable(std::vector<unsigned char>& palette,
+                                  const unsigned char* in, size_t insize, size_t* pos,
+                                  unsigned size_exp) {
+  size_t num = (size_t)1 << (size_exp + 1);
+  if(insize - *pos < num * 3) return 203;
+  palette.resize(num * 3);
+  for(size_t i = 0; i < num * 3; i++) palette[i] = in[*pos + i];
+  *pos += num * 3;
+  return 0;
+}
+
+/*
+Decodes one GIF LZW compressed image data block (the minimum code size byte
+followed by the sub-blocks) into exactly outsize pixel indices.
+in/insize is the whole GIF file, *pos points at the minimum code size byte and
+is updated to just past the block terminator.
+Returns 0 or GIF error 203, 207, 208, 209 or 210.
+*/
+static unsigned gifLzwDecode(unsigned char* out, size_t outsize,
+                             const unsigned char* in, size_t insize, size_t* pos) {
+  if(insize - *pos < 1) return 203;
+  unsigned mincode = in[(*pos)++];
+  if(mincode < 2 || mincode > 8) return 207;
+
+  /*Gather the data sub-blocks into one contiguous buffer.*/
+  std::vector<unsigned char> data;
+  for(;;) {
+    if(insize - *pos < 1) return 203;
+    unsigned blocksize = in[(*pos)++];
+    if(blocksize == 0) break;
+    if(insize - *pos < blocksize) return 203;
+    data.insert(data.end(), in + *pos, in + *pos + blocksize);
+    *pos += blocksize;
+  }
+
+  const unsigned clear = 1u << mincode; /*clear code*/
+  const unsigned eoi = clear + 1; /*end of information code*/
+  unsigned short prefix[4096]; /*prefix code for each dictionary entry*/
+  unsigned char suffix[4096]; /*last byte of the string of each dictionary entry*/
+  unsigned char stack[4096]; /*for outputting a string in reverse*/
+  unsigned codesize = mincode + 1;
+  unsigned next = eoi + 1; /*next unused dictionary entry*/
+  int prev = -1; /*previously decoded code, -1 if none since last clear*/
+  size_t bitpos = 0;
+  size_t outpos = 0;
+  size_t nbits = data.size() * 8;
+
+  for(;;) {
+    if(bitpos + codesize > nbits) return 209; /*ran out of bits before the EOI code*/
+    unsigned code = 0;
+    for(unsigned i = 0; i < codesize; i++) {
+      code |= (unsigned)((data[(bitpos + i) >> 3] >> ((bitpos + i) & 7)) & 1) << i;
+    }
+    bitpos += codesize;
+
+    if(code == clear) {
+      codesize = mincode + 1;
+      next = eoi + 1;
+      prev = -1;
+      continue;
+    }
+    if(code == eoi) break;
+
+    /*Determine the string of the current code, output it, remember its first byte.*/
+    unsigned first; /*first byte of the string of code*/
+    if(prev < 0) {
+      /*The first code after a clear must be a literal.*/
+      if(code >= clear) return 208;
+      first = code;
+      if(outpos >= outsize) return 210;
+      out[outpos++] = (unsigned char)code;
+    } else {
+      unsigned c;
+      unsigned sp = 0;
+      if(code < next) {
+        c = code;
+      } else if(code == next) {
+        /*KwKwK case: the code is the entry currently being added, its string is
+        the string of prev plus the first byte of the string of prev.*/
+        c = (unsigned)prev;
+        stack[sp++] = 0; /*placeholder for the first byte of prev, corrected below*/
+        /*Walk prev to find its first byte and fix up the placeholder.*/
+        {
+          unsigned p = (unsigned)prev;
+          while(p >= clear) p = prefix[p];
+          stack[0] = (unsigned char)p;
+        }
+      } else {
+        return 208; /*code beyond the next unused entry: invalid*/
+      }
+      /*Output the string of c in reverse using the stack.*/
+      while(c >= clear) {
+        stack[sp++] = suffix[c];
+        c = prefix[c];
+      }
+      first = c; /*c is now a literal, which is the first byte of the string*/
+      stack[sp++] = (unsigned char)c;
+      while(sp > 0) {
+        if(outpos >= outsize) return 210;
+        out[outpos++] = stack[--sp];
+      }
+      /*Add prev+first to the dictionary.*/
+      if(next < 4096) {
+        prefix[next] = (unsigned short)prev;
+        suffix[next] = (unsigned char)first;
+        next++;
+        if(next == (1u << codesize) && codesize < 12) codesize++;
+      }
+    }
+    prev = (int)code;
+  }
+
+  if(outpos != outsize) return 210;
+  return 0;
+}
+
+/*Reorders decompressed pixel indices of an interlaced frame into row order.*/
+static void gifDeinterlace(std::vector<unsigned char>& indices, unsigned w, unsigned h) {
+  static const unsigned start[4] = {0, 4, 2, 1};
+  static const unsigned step[4] = {8, 8, 4, 2};
+  std::vector<unsigned char> temp;
+  temp.swap(indices);
+  indices.resize(temp.size());
+  size_t pos = 0;
+  for(unsigned pass = 0; pass < 4; pass++) {
+    for(unsigned y = start[pass]; y < h; y += step[pass]) {
+      for(unsigned x = 0; x < w; x++) indices[y * w + x] = temp[pos++];
+    }
+  }
+}
+
+unsigned decodeGIF(std::vector<GIFFrame>& frames, unsigned& w, unsigned& h,
+                   const unsigned char* in, size_t insize) {
+  frames.clear();
+  w = 0;
+  h = 0;
+  if(!in) return 203;
+  if(insize < 13) return 200; /*6 byte header + 7 byte logical screen descriptor*/
+  if(in[0] != 'G' || in[1] != 'I' || in[2] != 'F') return 201;
+  if(!(in[3] == '8' && (in[4] == '7' || in[4] == '9') && in[5] == 'a')) return 202;
+
+  w = gifRead16(in, 6);
+  h = gifRead16(in, 8);
+  if(w == 0 || h == 0) return 204;
+  if((size_t)w * (size_t)h > (size_t)LODEPNG_GIF_MAX_PIXELS) return 205;
+  unsigned packed = in[10];
+  /*in[11] is the background color index and in[12] the aspect ratio, both unused:
+  the canvas starts fully transparent instead of in the background color.*/
+  size_t pos = 13;
+
+  unsigned error;
+  std::vector<unsigned char> gct; /*global color table, RGB triplets*/
+  if(packed & 0x80) {
+    error = gifReadColorTable(gct, in, insize, &pos, packed & 7);
+    if(error) return error;
+  }
+
+  /*State from the most recent graphic control extension, applies to the next frame.*/
+  unsigned gce_delay = 0;
+  unsigned gce_disposal = 0;
+  int gce_transparent = -1; /*transparent color index, -1 if transparency disabled*/
+
+  std::vector<unsigned char> canvas((size_t)w * h * 4, 0); /*composited result so far*/
+  std::vector<unsigned char> saved; /*backup of canvas for disposal method 3*/
+
+  for(;;) {
+    if(insize - pos < 1) return 203; /*missing trailer byte*/
+    unsigned introducer = in[pos++];
+    if(introducer == 0x3B) break; /*trailer*/
+    if(introducer == 0x21) {
+      /*Extension block.*/
+      if(insize - pos < 1) return 203;
+      unsigned label = in[pos++];
+      if(label == 0xF9) {
+        /*Graphic control extension.*/
+        if(insize - pos < 1) return 203;
+        if(in[pos++] != 4) return 213; /*block size must be 4*/
+        if(insize - pos < 5) return 203;
+        unsigned gce_packed = in[pos];
+        gce_disposal = (gce_packed >> 2) & 7;
+        gce_delay = gifRead16(in, pos + 1);
+        gce_transparent = (gce_packed & 1) ? (int)in[pos + 3] : -1;
+        pos += 4;
+        if(in[pos++] != 0) return 213; /*block terminator*/
+      } else {
+        /*Other extension (comment, application, plain text, ...): skip its
+        sub-blocks, this uniformly handles the fixed header block as well.*/
+        for(;;) {
+          if(insize - pos < 1) return 203;
+          unsigned blocksize = in[pos++];
+          if(blocksize == 0) break;
+          if(insize - pos < blocksize) return 203;
+          pos += blocksize;
+        }
+      }
+    } else if(introducer == 0x2C) {
+      /*Image descriptor and image data: one frame.*/
+      if(insize - pos < 9) return 203;
+      unsigned fx = gifRead16(in, pos);
+      unsigned fy = gifRead16(in, pos + 2);
+      unsigned fw = gifRead16(in, pos + 4);
+      unsigned fh = gifRead16(in, pos + 6);
+      unsigned fpacked = in[pos + 8];
+      pos += 9;
+      if(fw == 0 || fh == 0) return 212;
+      if((size_t)fx + fw > (size_t)w || (size_t)fy + fh > (size_t)h) return 212;
+
+      std::vector<unsigned char> lct; /*local color table, RGB triplets*/
+      if(fpacked & 0x80) {
+        error = gifReadColorTable(lct, in, insize, &pos, fpacked & 7);
+        if(error) return error;
+      }
+      const std::vector<unsigned char>& table = lct.empty() ? gct : lct;
+      if(table.empty()) return 206;
+      unsigned tablesize = (unsigned)(table.size() / 3);
+      if(gce_transparent >= (int)tablesize) return 214;
+
+      std::vector<unsigned char> indices((size_t)fw * fh);
+      error = gifLzwDecode(&indices[0], indices.size(), in, insize, &pos);
+      if(error) return error;
+      if(fpacked & 0x40) gifDeinterlace(indices, fw, fh);
+
+      if(gce_disposal == 3) saved = canvas; /*backup before drawing, for restore after*/
+
+      /*Draw the frame onto the canvas. Transparent pixels keep the canvas color.*/
+      for(unsigned y = 0; y < fh; y++) {
+        for(unsigned x = 0; x < fw; x++) {
+          unsigned idx = indices[y * fw + x];
+          if(gce_transparent >= 0 && idx == (unsigned)gce_transparent) continue;
+          if(idx >= tablesize) return 214;
+          size_t cpos = ((size_t)(fy + y) * w + fx + x) * 4;
+          canvas[cpos + 0] = table[idx * 3 + 0];
+          canvas[cpos + 1] = table[idx * 3 + 1];
+          canvas[cpos + 2] = table[idx * 3 + 2];
+          canvas[cpos + 3] = 255;
+        }
+      }
+
+      GIFFrame frame;
+      frame.image = canvas;
+      frame.delay = gce_delay;
+      frames.push_back(frame);
+      /*Avoid unbounded growth of the vector's capacity overhead: none needed,
+      the frames themselves are the intended output.*/
+
+      /*Apply this frame's disposal method to prepare the canvas for the next frame.
+      Methods 4-7 are undefined by the spec and treated as "no disposal".*/
+      if(gce_disposal == 2) {
+        /*Restore to background: the canvas started transparent, so clear the rect.*/
+        for(unsigned y = 0; y < fh; y++) {
+          for(unsigned x = 0; x < fw; x++) {
+            size_t cpos = ((size_t)(fy + y) * w + fx + x) * 4;
+            canvas[cpos + 0] = canvas[cpos + 1] = canvas[cpos + 2] = canvas[cpos + 3] = 0;
+          }
+        }
+      } else if(gce_disposal == 3) {
+        canvas = saved;
+      }
+
+      /*The graphic control extension only applies to one frame.*/
+      gce_delay = 0;
+      gce_disposal = 0;
+      gce_transparent = -1;
+    } else {
+      return 215;
+    }
+  }
+
+  if(frames.empty()) return 211;
+  return 0;
+}
+
+unsigned decodeGIF(std::vector<GIFFrame>& frames, unsigned& w, unsigned& h,
+                   const std::vector<unsigned char>& in) {
+  return decodeGIF(frames, w, h, in.empty() ? NULL : &in[0], in.size());
+}
+
+const char* gifErrorText(unsigned code) {
+  switch(code) {
+    case 200: return "GIF error 200: file too small to contain a GIF header";
+    case 201: return "GIF error 201: invalid GIF signature";
+    case 202: return "GIF error 202: unsupported GIF version (only GIF87a and GIF89a)";
+    case 203: return "GIF error 203: unexpected end of data (truncated file)";
+    case 204: return "GIF error 204: logical screen has zero width or height";
+    case 205: return "GIF error 205: too many pixels in the logical screen";
+    case 206: return "GIF error 206: image has no color table";
+    case 207: return "GIF error 207: invalid LZW minimum code size";
+    case 208: return "GIF error 208: LZW stream error (invalid code)";
+    case 209: return "GIF error 209: LZW stream ended without end-of-information code";
+    case 210: return "GIF error 210: decoded pixel count does not match frame rectangle";
+    case 211: return "GIF error 211: the GIF contains no image frames";
+    case 212: return "GIF error 212: invalid frame rectangle";
+    case 213: return "GIF error 213: malformed graphic control extension";
+    case 214: return "GIF error 214: color index out of range of the active color table";
+    case 215: return "GIF error 215: unknown block type in the GIF stream";
+    default: return lodepng_error_text(code);
+  }
+}
+
 } // namespace lodepng
