@@ -1415,6 +1415,256 @@ cleanup:
   return error;
 }
 
+/*
+ICC application with precomputed lookup tables (fast path).
+
+The general convertRGBModel path below parses the ICC profile and evaluates
+the tone curves and matrices per pixel, which is wasteful for 8-bit images
+where each channel only has 256 possible values.
+
+For the matrix/tone-curve based RGB and grayscale ICC subset (the only
+profile kind the parser in this file supports), the color transform is:
+
+  encoded source RGB
+    -- forward TRC (per channel) --> linear source RGB
+    -- source RGB->XYZ matrix --> XYZ
+    -- whitepoint adaptation --> adapted XYZ
+    -- inverse of sRGB XYZ->RGB matrix --> linear sRGB
+    -- inverse sRGB TRC --> encoded sRGB
+
+This is the same chain the exact float XYZ pipeline runs, but here every
+expensive part is precomputed once into lookup tables so the per-pixel work
+is only table lookups and a 3x3 matrix-vector product - no ICC parsing, no
+pow and no curve inversion while iterating pixels:
+
+*) The three forward tone curves are sampled into exact 256-entry tables, one
+   index per possible 8-bit input value (no interpolation needed).
+*) The source RGB->XYZ matrix, whitepoint adaptation and inverse sRGB matrix
+   are multiplied once into a single combined 3x3 matrix.
+*) The inverse sRGB encoding curve is stored densely so it can be evaluated
+   by linear interpolation. Profiles without a matrix are not in the parsed
+   subset anyway and fall through to the float pipeline (the LUT-based
+   approximation case).
+*) Grayscale profiles only have a tone curve, baked into one 256-entry table.
+
+Everything that is not an 8-bit RGB/gray to sRGB conversion of a supported
+profile keeps using the original float XYZ pipeline unchanged.
+*/
+
+/* Dense inverse-sRGB-encoding table. It covers linear values slightly outside
+0..1 so out-of-gamut (wide gamut source) values are handled by the same
+interpolation, only being clamped when rounded to the 8-bit output. */
+#define LODEPNG_ICC_INV_TABLE_SIZE 4096
+#define LODEPNG_ICC_INV_TABLE_MIN (-0.25f)
+#define LODEPNG_ICC_INV_TABLE_MAX (1.5f)
+
+typedef struct {
+  unsigned use_icc;    /* 0 when the LUT could not be built, caller must use fallback */
+  unsigned inputspace; /* 1 = gray, 2 = RGB (matches LodePNGICC.inputspace) */
+  /* RGB only: exact forward TRC tables, 256 entries (linear value per byte). */
+  float trc_r[256];
+  float trc_g[256];
+  float trc_b[256];
+  float matrix[9];     /* combined linear-source-RGB -> linear-sRGB matrix */
+  /* shared: dense inverse sRGB encoding table (linear -> encoded 0..1). */
+  float inv_srgb[LODEPNG_ICC_INV_TABLE_SIZE];
+  /* gray only: fully baked sRGB-encoded output per 8-bit input. */
+  float gray[256];
+} LodePNGICCLut;
+
+static void lodepng_icc_lut_init(LodePNGICCLut* lut) {
+  lut->use_icc = 0;
+  lut->inputspace = 0;
+}
+
+/* Populates the dense inverse sRGB encoding table: linear 0..1 -> encoded. */
+static void lodepng_icc_lut_build_inv_srgb(LodePNGICCLut* lut) {
+  size_t i;
+  for(i = 0; i < LODEPNG_ICC_INV_TABLE_SIZE; i++) {
+    float v = LODEPNG_ICC_INV_TABLE_MIN +
+        (LODEPNG_ICC_INV_TABLE_MAX - LODEPNG_ICC_INV_TABLE_MIN) *
+        ((float)i / (float)(LODEPNG_ICC_INV_TABLE_SIZE - 1));
+    /* Same sRGB gamma compression as convertFromXYZ_gamma. */
+    if(v < 0.0031308f) {
+      lut->inv_srgb[i] = v * 12.92f;
+    } else {
+      lut->inv_srgb[i] = 1.055f * lodepng_powf(v, 1.0f / 2.4f) - 0.055f;
+    }
+  }
+}
+
+/* Evaluates the dense inverse sRGB table with linear interpolation. */
+static float lodepng_icc_lut_inv_srgb(const LodePNGICCLut* lut, float v) {
+  float fpos;
+  size_t pos;
+  float frac;
+  if(v <= LODEPNG_ICC_INV_TABLE_MIN) return lut->inv_srgb[0];
+  if(v >= LODEPNG_ICC_INV_TABLE_MAX) return lut->inv_srgb[LODEPNG_ICC_INV_TABLE_SIZE - 1];
+  fpos = (v - LODEPNG_ICC_INV_TABLE_MIN) /
+         (LODEPNG_ICC_INV_TABLE_MAX - LODEPNG_ICC_INV_TABLE_MIN) *
+         (float)(LODEPNG_ICC_INV_TABLE_SIZE - 1);
+  pos = (size_t)fpos;
+  frac = fpos - (float)pos;
+  return lut->inv_srgb[pos] * (1.0f - frac) + lut->inv_srgb[pos + 1] * frac;
+}
+
+/* Builds the combined matrix that maps linear source RGB directly to linear
+sRGB, folding in whitepoint adaptation for relative rendering intent. */
+static unsigned lodepng_icc_lut_build_matrix(float result[9], const LodePNGICC* icc,
+                                             unsigned rendering_intent) {
+  float m_src[9];      /* linear source RGB -> XYZ */
+  float m_srgb_inv[9]; /* XYZ -> linear sRGB */
+  float whitepoint[3];
+  static const float srgb[9] = {
+      0.4124564f, 0.3575761f, 0.1804375f,
+      0.2126729f, 0.7151522f, 0.0721750f,
+      0.0193339f, 0.1191920f, 0.9503041f
+  };
+  size_t i;
+
+  if(getICCChrm(m_src, whitepoint, icc)) return 1;
+
+  for(i = 0; i < 9; i++) m_srgb_inv[i] = srgb[i];
+  if(invMatrix(m_srgb_inv)) return 1;
+
+  if(rendering_intent != 3) {
+    /* Relative intent: adapt from the source whitepoint to the sRGB
+    whitepoint, exactly as convertFromXYZ_chrm does. */
+    float a[9] = {1,0,0, 0,1,0, 0,0,1};
+    static const float srgb_white[3] = {
+      0.9504559270516716f, 1.0f, 1.0890577507598784f
+    };
+    if(getAdaptationMatrix(a, 1, whitepoint[0], whitepoint[1], whitepoint[2],
+                           srgb_white[0], srgb_white[1], srgb_white[2])) {
+      return 1;
+    }
+    /* m_srgb_inv <- m_srgb_inv * adaptation */
+    mulMatrixMatrix(m_srgb_inv, m_srgb_inv, a);
+  }
+
+  /* result <- m_srgb_inv * m_src */
+  mulMatrixMatrix(result, m_srgb_inv, m_src);
+  return 0;
+}
+
+/* Precomputes all tables for converting 8-bit pixels described by state_in to
+sRGB. Returns 0 on success. A non-zero return means the profile is corrupted
+(its parse error is propagated) or belongs to an unsupported subset, in which
+case use_icc stays 0 and the caller falls back to the float pipeline. */
+static unsigned lodepng_icc_lut_build(LodePNGICCLut* lut, const LodePNGState* state_in,
+                                      unsigned rendering_intent) {
+  unsigned error = 0;
+  const LodePNGInfo* info = &state_in->info_png;
+  size_t i;
+
+  if(!info->iccp_defined) return 1;
+
+  {
+    /* Reuse the exact same parser/validator as the float pipeline. */
+    LodePNGICC icc;
+    lodepng_icc_init(&icc);
+    error = parseICC(&icc, info->iccp_profile, info->iccp_profile_size);
+    if(error) {
+      lodepng_icc_cleanup(&icc);
+      return error; /* corrupted ICC profile */
+    }
+    lut->use_icc = validateICC(&icc);
+    if(!lut->use_icc) {
+      lodepng_icc_cleanup(&icc);
+      return 1; /* unsupported profile subset, use fallback */
+    }
+    lut->inputspace = (unsigned)icc.inputspace;
+
+    lodepng_icc_lut_build_inv_srgb(lut);
+
+    if(icc.inputspace == 2) {
+      /* Exact forward TRC tables: one entry per possible 8-bit input. */
+      for(i = 0; i < 256; i++) {
+        float v = (float)i * (1.0f / 255.0f);
+        lut->trc_r[i] = iccForwardTRC(&icc.trc[0], v);
+        lut->trc_g[i] = iccForwardTRC(&icc.trc[1], v);
+        lut->trc_b[i] = iccForwardTRC(&icc.trc[2], v);
+      }
+      error = lodepng_icc_lut_build_matrix(lut->matrix, &icc, rendering_intent);
+      if(error) {
+        lodepng_icc_cleanup(&icc);
+        return error;
+      }
+    } else if(icc.inputspace == 1) {
+      /* Grayscale: only a tone curve, bake it fully to sRGB-encoded output.
+      This is the same conversion the float pipeline produces for gray. */
+      for(i = 0; i < 256; i++) {
+        float linear = iccForwardTRC(&icc.trc[0], (float)i * (1.0f / 255.0f));
+        lut->gray[i] = lodepng_icc_lut_inv_srgb(lut, linear);
+      }
+    } else {
+      lodepng_icc_cleanup(&icc);
+      return 1; /* unsupported color model (CMYK, Lab, ...) */
+    }
+
+    lodepng_icc_cleanup(&icc);
+  }
+
+  return 0;
+}
+
+/* Returns 1 if the given raw byte format can be served by the fast path:
+8-bit RGB/RGBA for RGB profiles, 8-bit gray/gray+alpha for gray profiles. */
+static unsigned lodepng_icc_lut_supports(const LodePNGICCLut* lut, const LodePNGColorMode* mode) {
+  if(mode->bitdepth != 8) return 0;
+  if(lut->inputspace == 2) {
+    return mode->colortype == LCT_RGB || mode->colortype == LCT_RGBA;
+  } else if(lut->inputspace == 1) {
+    return mode->colortype == LCT_GREY || mode->colortype == LCT_GREY_ALPHA;
+  }
+  return 0;
+}
+
+/* The tables bake to sRGB, so they may only replace the float pipeline when
+the target state actually represents the default sRGB model. */
+static unsigned lodepng_icc_lut_target_is_srgb(const LodePNGState* state_out) {
+  const LodePNGInfo* info = state_out ? &state_out->info_png : 0;
+  return isSRGB(info);
+}
+
+static unsigned char lodepng_icc_lut_round(float v) {
+  int r = (int)(0.5f + 255.0f * v);
+  if(r < 0) r = 0;
+  if(r > 255) r = 255;
+  return (unsigned char)r;
+}
+
+/* Applies the precomputed tables pixel by pixel. Alpha bytes are copied
+untouched. */
+static void lodepng_icc_lut_apply(const LodePNGICCLut* lut, unsigned char* out,
+                                  const unsigned char* in, size_t n,
+                                  const LodePNGColorMode* mode) {
+  size_t i;
+  if(lut->inputspace == 2) {
+    unsigned channels = (mode->colortype == LCT_RGBA) ? 4 : 3;
+    const float* m = lut->matrix;
+    for(i = 0; i < n; i++) {
+      float lr = lut->trc_r[in[i * channels + 0]];
+      float lg = lut->trc_g[in[i * channels + 1]];
+      float lb = lut->trc_b[in[i * channels + 2]];
+      /* combined matrix: linear source RGB -> linear sRGB */
+      float sr = m[0] * lr + m[1] * lg + m[2] * lb;
+      float sg = m[3] * lr + m[4] * lg + m[5] * lb;
+      float sb = m[6] * lr + m[7] * lg + m[8] * lb;
+      out[i * channels + 0] = lodepng_icc_lut_round(lodepng_icc_lut_inv_srgb(lut, sr));
+      out[i * channels + 1] = lodepng_icc_lut_round(lodepng_icc_lut_inv_srgb(lut, sg));
+      out[i * channels + 2] = lodepng_icc_lut_round(lodepng_icc_lut_inv_srgb(lut, sb));
+      if(channels == 4) out[i * channels + 3] = in[i * channels + 3];
+    }
+  } else {
+    unsigned channels = (mode->colortype == LCT_GREY_ALPHA) ? 2 : 1;
+    for(i = 0; i < n; i++) {
+      out[i * channels + 0] = lodepng_icc_lut_round(lut->gray[in[i * channels + 0]]);
+      if(channels == 2) out[i * channels + 1] = in[i * channels + 1];
+    }
+  }
+}
+
 unsigned convertRGBModel(unsigned char* out, const unsigned char* in,
                          unsigned w, unsigned h,
                          const LodePNGState* state_out,
@@ -1426,13 +1676,34 @@ unsigned convertRGBModel(unsigned char* out, const unsigned char* in,
     unsigned error = 0;
     size_t n, bytes;
     if(lodepng_mulofl((size_t)w, (size_t)h, &n)) return 92;
+
+    /* Fast path: precompute the ICC tone curves into 256-entry LUTs and the
+    matrices into one combined matrix once, then apply them per pixel without
+    re-parsing the profile. Only used for the supported 8-bit ICC -> sRGB
+    case; anything else (16-bit, float entry points, unsupported profile
+    subset) keeps using the exact float XYZ pipeline below. */
+    if(state_in->info_png.iccp_defined && lodepng_icc_lut_target_is_srgb(state_out)) {
+      LodePNGICCLut lut;
+      lodepng_icc_lut_init(&lut);
+      error = lodepng_icc_lut_build(&lut, state_in, rendering_intent);
+      if(!error && lut.use_icc && lodepng_icc_lut_supports(&lut, &state_in->info_raw)) {
+        lodepng_icc_lut_apply(&lut, out, in, n, &state_in->info_raw);
+        return 0;
+      }
+      /* A corrupted ICC profile propagates its parse error; any other reason
+      for not having a LUT silently falls through to the float pipeline. */
+      if(error) return error;
+    }
+
     if(lodepng_mulofl(n, 4 * sizeof(float), &bytes)) return 92;
-    float* xyz = (float*)lodepng_malloc(bytes);
-    float whitepoint[3];
-    error = convertToXYZ(xyz, whitepoint, in, w, h, state_in);
-    if (!error) error = convertFromXYZ(out, xyz, w, h, state_out, whitepoint, rendering_intent);
-    lodepng_free(xyz);
-    return error;
+    {
+      float* xyz = (float*)lodepng_malloc(bytes);
+      float whitepoint[3];
+      error = convertToXYZ(xyz, whitepoint, in, w, h, state_in);
+      if (!error) error = convertFromXYZ(out, xyz, w, h, state_out, whitepoint, rendering_intent);
+      lodepng_free(xyz);
+      return error;
+    }
   }
 }
 
