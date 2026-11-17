@@ -1110,6 +1110,100 @@ unsigned lodepng_chunk_create(unsigned char** out, size_t* outsize, size_t lengt
 
 /*Calculate CRC32 of buffer*/
 unsigned lodepng_crc32(const unsigned char* buf, size_t len);
+
+/*
+Default and hard bounds for a single txMt chunk payload. The default of 8 MiB
+(8388608 bytes) is half of the decoder's max_text_size (16 MiB): it keeps a
+chunks-worth of compressed text and its decompressed form within that 16 MiB
+budget, stays far below the 2147483647 byte PNG per-chunk hard limit, and
+matches common safe network/container limits. It can be overridden through
+LodePNGTextPackSettings.max_chunk_payload, but never above
+LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD_LIMIT.
+*/
+#define LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD 8388608u
+#define LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD_LIMIT 2147483647u
+
+/*
+Packed text chunk ("txMt") support.
+
+A "txMt" chunk is a private, ancillary PNG chunk that stores one or more
+keyword/text entries in a single chunk, optionally zlib compressing the text
+bodies. It is an extension of this LodePNG build, not a PNG standard chunk;
+standard decoders that do not know it will simply ignore it.
+
+Chunk payload layout (all multi-byte integers are big endian):
+  1 byte   flags: bit 0 = entries are zlib compressed, other bits reserved (0)
+  repeated for each entry:
+    4 bytes  key length   (uint32, must be 1..79)
+    N bytes  key bytes
+    4 bytes  value length (uint32)
+    M bytes  value bytes (raw, or zlib stream when the flags bit is set)
+
+When the compressed flag is set, every value field holds one complete zlib
+stream. Keys are never compressed. A corrupt zlib stream makes decoding fail
+with the corresponding zlib error instead of returning garbage.
+*/
+typedef struct LodePNGTextPackSettings LodePNGTextPackSettings;
+struct LodePNGTextPackSettings {
+  /*Enable zlib compression of text values (feature segment 1).*/
+  unsigned compress_enabled;
+  /*Merge all entries into a single txMt chunk instead of one chunk per
+  entry (feature segment 2). When 0, each entry is emitted as its own txMt
+  chunk containing exactly one entry.*/
+  unsigned merge_enabled;
+  /*Enable the size threshold (feature segment 3). When 1, values shorter
+  than compress_threshold bytes are stored uncompressed even when
+  compress_enabled is on. When 0, the threshold is ignored.*/
+  unsigned threshold_enabled;
+  /*Minimum raw value size, in bytes, for compression to be considered.*/
+  size_t compress_threshold;
+  /*zlib style compression level, 0 (no compression) .. 9 (best
+  compression). Values outside that range are rejected with error 61.*/
+  unsigned compression_level;
+  /*Maximum allowed payload size of one output chunk, in bytes. Payload
+  means the chunk data, excluding length, type and CRC (12 bytes). 0 means
+  use the built-in default LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD. Entries
+  that do not fit are rejected with error 124.*/
+  size_t max_chunk_payload;
+};
+
+/*Fills in the default settings: compression on, merging on, threshold on at
+128 bytes, level 6, default payload limit.*/
+void lodepng_text_pack_settings_init(LodePNGTextPackSettings* settings);
+
+/*
+Encodes keyword/text entries as txMt chunk(s) and appends them to out.
+keys/values point to num entries of sizes key_sizes/value_sizes; sized buffers
+are used so arbitrary bytes (including embedded zero bytes) are supported.
+The output is a sequence of standalone PNG chunks (length+type+data+CRC each),
+without PNG signature and without IHDR/IEND.
+Returns an error code (0 on success). Buffers handed back in out must be freed
+with lodepng_free.
+*/
+unsigned lodepng_text_pack_encode(unsigned char** out, size_t* outsize,
+                                  const char* const* keys, const size_t* key_sizes,
+                                  const unsigned char* const* values, const size_t* value_sizes,
+                                  size_t num, const LodePNGTextPackSettings* settings);
+
+/*
+Decodes txMt chunk(s) from the standalone chunk sequence in [in, in+insize)
+and appends the recovered entries to out_keys/out_values (both sized
+buffers). Chunks of other types, and PNG signature bytes if present, are
+skipped. Every chunk CRC is verified first (a bad CRC gives error 57).
+Zlib failures, truncated frames and unknown flag bits produce an error code,
+never partially decoded garbage: on error the output vectors may contain
+entries decoded before the failure and must still be cleaned up by the caller.
+Each appended key buffer is null terminated; value buffers are raw bytes of
+the reported size and are null terminated as well for convenience.
+*/
+unsigned lodepng_text_pack_decode(const unsigned char* in, size_t insize,
+                                  char*** out_keys, size_t** out_key_sizes,
+                                  unsigned char*** out_values, size_t** out_value_sizes,
+                                  size_t* out_num);
+
+/*Frees the arrays produced by lodepng_text_pack_decode.*/
+void lodepng_text_pack_free(char** keys, size_t* key_sizes,
+                            unsigned char** values, size_t* value_sizes, size_t num);
 #endif /*LODEPNG_COMPILE_PNG*/
 
 

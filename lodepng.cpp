@@ -7055,10 +7055,448 @@ const char* lodepng_error_text(unsigned code) {
     case 121: return "invalid chunk type name: may only contain [a-zA-Z]";
     case 122: return "invalid chunk type name: third character must be uppercase";
     case 123: return "invalid ICC profile size";
+    case 124: return "packed text chunk payload exceeds the configured maximum size";
+    case 125: return "malformed packed text (txMt) chunk";
   }
   return "unknown error code";
 }
 #endif /*LODEPNG_COMPILE_ERROR_TEXT*/
+
+/* ////////////////////////////////////////////////////////////////////////// */
+/* // Packed text chunks (txMt), see declaration in lodepng.h               // */
+/* // Only new code is added below; the standard tEXt/zTXt/iTXt paths are   // */
+/* // not modified and remain byte-for-byte identical.                      // */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+#define TXMT_CHUNK_TYPE "txMt"
+#define TXMT_FLAG_COMPRESSED 1u
+#define TXMT_KEY_MAX 79
+
+#ifdef LODEPNG_COMPILE_ENCODER
+/*Map a zlib-style level (0..9) onto LodePNGCompressSettings. Level 0 stores
+deflate blocks uncompressed, 1 uses fixed huffman without LZ77, 2..9 trade
+speed for ratio via window size, match eagerness and lazy matching. Returns 0
+on success, 61 for an out-of-range level.*/
+static unsigned txmt_level_to_settings(unsigned level, LodePNGCompressSettings* settings) {
+  lodepng_compress_settings_init(settings);
+  if(level > 9) return 61; /*invalid BTYPE/setting given in encoder settings*/
+  if(level == 0) {
+    settings->btype = 0;
+    settings->use_lz77 = 0;
+  } else if(level == 1) {
+    settings->btype = 1; /*fixed huffman, cheap*/
+    settings->windowsize = 256;
+    settings->nicematch = 8;
+    settings->lazymatching = 0;
+  } else {
+    static const unsigned windows[8] = {512, 1024, 2048, 4096, 8192, 16384, 32768, 32768};
+    static const unsigned nicematch[8] = {16, 32, 64, 128, 128, 258, 258, 258};
+    unsigned idx = level - 2;
+    settings->windowsize = windows[idx];
+    settings->nicematch = nicematch[idx];
+    settings->lazymatching = (level >= 4) ? 1 : 0;
+  }
+  return 0;
+}
+
+void lodepng_text_pack_settings_init(LodePNGTextPackSettings* settings) {
+  settings->compress_enabled = 1;
+  settings->merge_enabled = 1;
+  settings->threshold_enabled = 1;
+  settings->compress_threshold = 128;
+  settings->compression_level = 6;
+  settings->max_chunk_payload = LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD;
+}
+
+/*append a 32 bit big endian integer to a byte vector*/
+static unsigned txmt_append32(ucvector* v, size_t value) {
+  unsigned char bytes[4];
+  if(value > 0xffffffffu) return 125; /*malformed packed text chunk*/
+  lodepng_set32bitInt(bytes, (unsigned)value);
+  if(!ucvector_resize(v, v->size + 4)) return 83; /*alloc fail*/
+  lodepng_memcpy(v->data + v->size - 4, bytes, 4);
+  return 0;
+}
+
+/*append raw bytes to a byte vector*/
+static unsigned txmt_append_bytes(ucvector* v, const unsigned char* data, size_t size) {
+  size_t new_size;
+  if(lodepng_addofl(v->size, size, &new_size)) return 77; /*integer overflow*/
+  if(!ucvector_resize(v, new_size)) return 83; /*alloc fail*/
+  if(size) lodepng_memcpy(v->data + v->size - size, data, size);
+  return 0;
+}
+
+/*Encode one entry's frame (key length, key, value length, value) into payload,
+compressing the value when do_compress is set. out_kept_zlib reports whether the
+value bytes stored in the frame are an actual zlib stream.*/
+static unsigned txmt_encode_entry(ucvector* payload, const char* key, size_t key_size,
+                                  const unsigned char* value, size_t value_size,
+                                  unsigned do_compress, unsigned level,
+                                  unsigned* out_kept_zlib) {
+  unsigned error;
+  unsigned char* zbuf = 0;
+  size_t zsize = 0;
+  const unsigned char* out_value = value;
+  size_t out_value_size = value_size;
+  unsigned kept_zlib = 0;
+
+  if(out_kept_zlib) *out_kept_zlib = 0;
+  if(key_size < 1 || key_size > TXMT_KEY_MAX) return 89; /*keyword too short or long*/
+
+  if(do_compress) {
+    LodePNGCompressSettings csettings;
+    error = txmt_level_to_settings(level, &csettings);
+    if(error) return error;
+    error = zlib_compress(&zbuf, &zsize, value, value_size, &csettings);
+    if(error) {
+      lodepng_free(zbuf);
+      return error;
+    }
+    /*Only keep the compressed form when it is actually smaller. Already
+    compressed/random data typically does not shrink; storing it raw keeps the
+    chunk smaller. Empty values cannot shrink either and have no zlib stream.*/
+    if(zsize > 0 && zsize < value_size) {
+      out_value = zbuf;
+      out_value_size = zsize;
+      kept_zlib = 1;
+    } else {
+      lodepng_free(zbuf);
+      zbuf = 0;
+    }
+  }
+
+  error = txmt_append32(payload, key_size);
+  if(!error) error = txmt_append_bytes(payload, (const unsigned char*)key, key_size);
+  if(!error) error = txmt_append32(payload, out_value_size);
+  if(!error) error = txmt_append_bytes(payload, out_value, out_value_size);
+
+  if(out_kept_zlib) *out_kept_zlib = kept_zlib;
+  lodepng_free(zbuf);
+  return error;
+}
+
+/*Wrap a finished payload as a txMt chunk and append it to the chunk stream.*/
+static unsigned txmt_emit_chunk(ucvector* out, const ucvector* payload, unsigned compressed) {
+  ucvector chunk = ucvector_init(0, 0);
+  unsigned char* raw = 0;
+  size_t rawsize = 0;
+  unsigned error;
+  size_t payload_size;
+
+  if(!ucvector_resize(&chunk, 1 + payload->size)) {
+    lodepng_free(chunk.data);
+    return 83; /*alloc fail*/
+  }
+  chunk.data[0] = compressed ? TXMT_FLAG_COMPRESSED : 0;
+  if(payload->size) lodepng_memcpy(chunk.data + 1, payload->data, payload->size);
+  payload_size = chunk.size;
+
+  error = lodepng_chunk_create(&raw, &rawsize, payload_size, TXMT_CHUNK_TYPE, chunk.data);
+  lodepng_free(chunk.data);
+  if(error) return error;
+  error = lodepng_chunk_append(&out->data, &out->size, raw);
+  lodepng_free(raw);
+  return error;
+}
+
+/*One encoded entry: its framed bytes plus whether its value is a zlib stream.*/
+typedef struct TxMtFrame {
+  ucvector data;
+  unsigned compressed;
+} TxMtFrame;
+
+static void txmt_frame_cleanup(TxMtFrame* frame) {
+  lodepng_free(frame->data.data);
+  frame->data.data = 0;
+  frame->data.size = frame->data.allocsize = 0;
+}
+
+unsigned lodepng_text_pack_encode(unsigned char** out, size_t* outsize,
+                                  const char* const* keys, const size_t* key_sizes,
+                                  const unsigned char* const* values, const size_t* value_sizes,
+                                  size_t num, const LodePNGTextPackSettings* settings_in) {
+  LodePNGTextPackSettings settings;
+  ucvector result = ucvector_init(*out, *outsize);
+  TxMtFrame* frames = 0;
+  size_t limit;
+  size_t i;
+  unsigned error = 0;
+
+  if(!settings_in) lodepng_text_pack_settings_init(&settings);
+  else settings = *settings_in;
+
+  if(settings.compression_level > 9) return 61;
+  limit = settings.max_chunk_payload;
+  if(limit == 0) limit = LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD;
+  if(limit > LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD_LIMIT) {
+    limit = LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD_LIMIT;
+  }
+
+  /*Stage 1: encode each entry independently into a frame.*/
+  if(num) {
+    frames = (TxMtFrame*)lodepng_malloc(num * sizeof(TxMtFrame));
+    if(!frames) return 83; /*alloc fail*/
+    for(i = 0; i != num; ++i) {
+      frames[i].data = ucvector_init(0, 0);
+      frames[i].compressed = 0;
+    }
+  }
+
+  for(i = 0; i != num && !error; ++i) {
+    unsigned do_compress = settings.compress_enabled;
+    size_t value_size = value_sizes ? value_sizes[i] : 0;
+    size_t key_size = key_sizes ? key_sizes[i]
+                                : (keys ? lodepng_strlen(keys[i]) : 0);
+
+    if(do_compress && settings.threshold_enabled
+       && value_size < settings.compress_threshold) {
+      do_compress = 0;
+    }
+
+    error = txmt_encode_entry(&frames[i].data, keys ? keys[i] : 0, key_size,
+                              values ? values[i] : 0, value_size,
+                              do_compress, settings.compression_level,
+                              &frames[i].compressed);
+    if(error) break;
+
+    /*A single frame, plus the chunk flag byte, must fit the payload limit.*/
+    if(frames[i].data.size + 1 > limit) {
+      error = 124; /*packed text chunk payload exceeds configured maximum*/
+      break;
+    }
+  }
+
+  /*Stage 2: group frames into chunks. A chunk carries one flag shared by all
+  entries it contains, so zlib-stream frames and raw frames never share a chunk.
+  When merging is off, every frame is emitted as its own chunk.*/
+  if(!error) {
+    ucvector payload = ucvector_init(0, 0);
+    unsigned payload_compressed = 0;
+    unsigned have = 0;
+
+    for(i = 0; i <= num && !error; ++i) {
+      unsigned flush = (i == num);
+      unsigned frame_compressed = flush ? 0 : frames[i].compressed;
+      size_t combined = 0;
+      unsigned too_large = 0;
+      if(!flush && lodepng_addofl(payload.size, frames[i].data.size, &combined)) {
+        error = 77; /*integer overflow in buffer size*/
+        break;
+      }
+      if(!flush && lodepng_addofl(combined, 1, &combined)) {
+        error = 77;
+        break;
+      }
+      if(!flush && combined > limit) too_large = 1;
+      unsigned want_flush = have && (flush
+                          || frame_compressed != payload_compressed
+                          || settings.merge_enabled == 0
+                          || too_large);
+
+      if(want_flush) {
+        error = txmt_emit_chunk(&result, &payload, payload_compressed);
+        lodepng_free(payload.data);
+        payload = ucvector_init(0, 0);
+        have = 0;
+      }
+      if(flush) break;
+      if(!have) {
+        payload_compressed = frame_compressed;
+        have = 1;
+      }
+      error = txmt_append_bytes(&payload, frames[i].data.data, frames[i].data.size);
+    }
+    lodepng_free(payload.data);
+  }
+
+  if(frames) {
+    for(i = 0; i != num; ++i) txmt_frame_cleanup(&frames[i]);
+    lodepng_free(frames);
+  }
+  *out = result.data;
+  *outsize = result.size;
+  return error;
+}
+#endif /*LODEPNG_COMPILE_ENCODER*/
+
+#ifdef LODEPNG_COMPILE_DECODER
+/*Read a 32 bit big endian integer with strict bounds checking.*/
+static unsigned txmt_read32(const unsigned char* data, size_t size, size_t* pos, size_t* value) {
+  if(*pos + 4 > size) return 125; /*malformed packed text chunk*/
+  *value = lodepng_read32bitInt(data + *pos);
+  *pos += 4;
+  return 0;
+}
+
+/*Grow the four output pointer arrays by one slot. On allocation failure the
+original arrays are left untouched and 83 is returned.*/
+static unsigned txmt_grow_arrays(char*** out_keys, size_t** out_key_sizes,
+                                 unsigned char*** out_values, size_t** out_value_sizes,
+                                 size_t out_num) {
+  size_t need = out_num + 1;
+  char** nkeys;
+  size_t* nks;
+  unsigned char** nvalues;
+  size_t* nvs;
+
+  nkeys = (char**)lodepng_realloc(*out_keys, need * sizeof(char*));
+  if(!nkeys) return 83; /*alloc fail*/
+  *out_keys = nkeys;
+  nks = (size_t*)lodepng_realloc(*out_key_sizes, need * sizeof(size_t));
+  if(!nks) return 83; /*original *out_key_sizes is still valid*/
+  *out_key_sizes = nks;
+  nvalues = (unsigned char**)lodepng_realloc(*out_values, need * sizeof(unsigned char*));
+  if(!nvalues) return 83;
+  *out_values = nvalues;
+  nvs = (size_t*)lodepng_realloc(*out_value_sizes, need * sizeof(size_t));
+  if(!nvs) return 83;
+  *out_value_sizes = nvs;
+  return 0;
+}
+
+/*Decode the payload of one txMt chunk.*/
+static unsigned txmt_decode_payload(const unsigned char* data, size_t size, size_t limit,
+                                    char*** out_keys, size_t** out_key_sizes,
+                                    unsigned char*** out_values, size_t** out_value_sizes,
+                                    size_t* out_num) {
+  unsigned error = 0;
+  size_t pos = 0;
+  unsigned flags, compressed;
+  LodePNGDecompressSettings dsettings;
+  char* key = 0;
+  unsigned char* raw_value = 0;
+  size_t raw_size = 0;
+
+  if(size < 1) return 125; /*malformed packed text chunk*/
+  flags = data[pos++];
+  if(flags & ~TXMT_FLAG_COMPRESSED) return 125; /*unknown reserved flag bits*/
+  compressed = flags & TXMT_FLAG_COMPRESSED;
+  lodepng_decompress_settings_init(&dsettings);
+  /*Bound decompression so a malicious small stream cannot expand without end.
+  The per-chunk payload limit is also a sane decompression budget.*/
+  dsettings.max_output_size = limit ? limit : LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD;
+
+  while(pos < size && !error) {
+    size_t key_size, value_size;
+    key = 0;
+    raw_value = 0;
+    raw_size = 0;
+
+    error = txmt_read32(data, size, &pos, &key_size);
+    if(error) break;
+    if(key_size < 1 || key_size > TXMT_KEY_MAX) { error = 125; break; }
+    if(pos + key_size > size) { error = 125; break; }
+
+    key = (char*)lodepng_malloc(key_size + 1);
+    if(!key) { error = 83; break; }
+    lodepng_memcpy(key, data + pos, key_size);
+    key[key_size] = 0;
+    pos += key_size;
+
+    error = txmt_read32(data, size, &pos, &value_size);
+    if(error) break;
+    if(pos + value_size > size) { error = 125; break; }
+
+    if(compressed) {
+      /*A zlib stream on a zero-length value is invalid; require real data.*/
+      if(value_size == 0) { error = 125; break; }
+      error = zlib_decompress(&raw_value, &raw_size, 0, data + pos, value_size, &dsettings);
+      if(error) break; /*corrupt zlib data: propagate the zlib error, no garbage*/
+    } else {
+      raw_value = (unsigned char*)lodepng_malloc(value_size + 1);
+      if(!raw_value) { error = 83; break; }
+      lodepng_memcpy(raw_value, data + pos, value_size);
+      raw_value[value_size] = 0;
+      raw_size = value_size;
+    }
+    pos += value_size;
+
+    error = txmt_grow_arrays(out_keys, out_key_sizes, out_values, out_value_sizes,
+                             *out_num);
+    if(error) break;
+    (*out_keys)[*out_num] = key;
+    (*out_key_sizes)[*out_num] = key_size;
+    (*out_values)[*out_num] = raw_value;
+    (*out_value_sizes)[*out_num] = raw_size;
+    *out_num += 1;
+    key = 0;
+    raw_value = 0;
+  }
+
+  /*on error these only hold buffers not yet handed to the output arrays*/
+  lodepng_free(key);
+  lodepng_free(raw_value);
+  if(pos != size && !error) error = 125; /*trailing bytes: malformed frame*/
+  return error;
+}
+
+unsigned lodepng_text_pack_decode(const unsigned char* in, size_t insize,
+                                  char*** out_keys, size_t** out_key_sizes,
+                                  unsigned char*** out_values, size_t** out_value_sizes,
+                                  size_t* out_num) {
+  const unsigned char* chunk;
+  const unsigned char* end;
+  unsigned error = 0;
+  size_t limit = LODEPNG_TEXT_PACK_MAX_CHUNK_PAYLOAD;
+
+  *out_keys = 0;
+  *out_key_sizes = 0;
+  *out_values = 0;
+  *out_value_sizes = 0;
+  *out_num = 0;
+
+  /*Skip an 8 byte PNG signature if present. Unlike lodepng_chunk_next_const
+  this must not run once per iteration: that helper treats its first argument
+  as a signature whenever it sees the magic bytes, so calling it on the first
+  real chunk would silently drop it.*/
+  if(insize >= 8 && in[0] == 0x89 && in[1] == 0x50 && in[2] == 0x4e
+     && in[3] == 0x47 && in[4] == 0x0d && in[5] == 0x0a
+     && in[6] == 0x1a && in[7] == 0x0a) {
+    chunk = in + 8;
+  } else {
+    chunk = in;
+  }
+  end = in + insize;
+  while(chunk < end && !error) {
+    size_t chunk_length;
+    const unsigned char* data;
+    /*the full framing (4 length + 4 type + 4 CRC) must be present before any
+    field of the chunk is read, so truncated input reports an error instead
+    of reading past the buffer*/
+    if(end - chunk < 12) { error = 125; break; }
+    chunk_length = lodepng_chunk_length(chunk);
+    if(chunk_length + 12 > (size_t)(end - chunk)) { error = 30; break; } /*truncated chunk*/
+    if(lodepng_chunk_check_crc(chunk)) { error = 57; break; } /*invalid CRC*/
+    if(chunk_length > limit) { error = 124; break; }
+
+    if(lodepng_chunk_type_equals(chunk, TXMT_CHUNK_TYPE)) {
+      data = lodepng_chunk_data_const(chunk);
+      error = txmt_decode_payload(data, chunk_length, limit,
+                                  out_keys, out_key_sizes, out_values,
+                                  out_value_sizes, out_num);
+    }
+    /*chunks of any other type are intentionally ignored*/
+    chunk = lodepng_chunk_next_const(chunk, end);
+  }
+  return error;
+}
+
+void lodepng_text_pack_free(char** keys, size_t* key_sizes,
+                            unsigned char** values, size_t* value_sizes, size_t num) {
+  size_t i;
+  (void)key_sizes;
+  (void)value_sizes;
+  for(i = 0; i != num; ++i) {
+    lodepng_free(keys ? keys[i] : 0);
+    lodepng_free(values ? values[i] : 0);
+  }
+  lodepng_free(keys);
+  lodepng_free(key_sizes);
+  lodepng_free(values);
+  lodepng_free(value_sizes);
+}
+#endif /*LODEPNG_COMPILE_DECODER*/
 
 /* ////////////////////////////////////////////////////////////////////////// */
 /* ////////////////////////////////////////////////////////////////////////// */
