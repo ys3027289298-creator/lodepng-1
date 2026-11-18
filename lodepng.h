@@ -827,6 +827,20 @@ typedef struct LodePNGDecoderSettings {
 
   unsigned color_convert; /*whether to convert the PNG to the color type you want. Default: yes*/
 
+  /*The amount of threads to use for parallel Adam7 deinterlacing when decoding
+  interlaced PNGs. The 7 Adam7 passes are independent reduced images, so they can be
+  unfiltered in parallel, and their pixels can be scattered back to their final
+  positions ("deinterlaced") in parallel row blocks, all reading from the shared
+  decompressed IDAT buffer and writing to disjoint parts of the output image.
+  1 (the default) means fully sequential decoding, 0 means autodetect the amount of
+  processors, any higher value uses up to that many threads (values above 64 are
+  clamped). Small images are always processed sequentially because the thread
+  overhead is not worth it there. This setting does not affect the zlib
+  decompression, which is always sequential. If lodepng is compiled with
+  LODEPNG_NO_THREADS, or on a platform without POSIX threads, this setting is
+  ignored and decoding is always sequential.*/
+  unsigned adam7_num_threads;
+
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
   unsigned read_text_chunks; /*if false but remember_unknown_chunks is true, they're stored in the unknown chunks*/
 

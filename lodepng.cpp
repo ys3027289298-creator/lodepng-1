@@ -39,6 +39,19 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 #include <stdlib.h> /* allocations */
 #endif /* LODEPNG_COMPILE_ALLOCATORS */
 
+/*
+Parallel Adam7 deinterlacing uses POSIX threads. Define LODEPNG_NO_THREADS to
+disable this (decoding is then always sequential, and adam7_num_threads in
+LodePNGDecoderSettings is ignored). On platforms without POSIX threads the
+sequential code is used automatically.
+*/
+#if defined(LODEPNG_COMPILE_DECODER) && !defined(LODEPNG_NO_THREADS) && \
+    (defined(__unix__) || defined(__unix) || defined(__APPLE__))
+#define LODEPNG_ADAM7_THREADS
+#include <pthread.h>
+#include <unistd.h> /* sysconf, to autodetect the amount of processors */
+#endif
+
 #if defined(_MSC_VER) && (_MSC_VER >= 1310) /*Visual Studio: A few warning types are not desired here.*/
 #pragma warning( disable : 4244 ) /*implicit conversions: not warned by gcc -Wall -Wextra and requires too much casts*/
 #pragma warning( disable : 4996 ) /*VS does not like fopen, but fopen_s is not standard C so unusable here*/
@@ -4760,11 +4773,313 @@ static void removePaddingBits(unsigned char* out, const unsigned char* in,
   }
 }
 
+/* ////////////////////////////////////////////////////////////////////////// */
+/* Parallel Adam7 deinterlacing                                               */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+The 7 Adam7 passes are independent reduced images: unfiltering a pass only depends
+on scanlines of that same pass, and every output pixel is written by exactly one
+pass. This allows parallelizing the Adam7 post-processing over multiple threads with
+a pipelined job queue:
+1) unfilter jobs: unfilter each of the 7 passes, largest pass first (the passes have
+   very unequal sizes: pass 7 alone contains about half of the pixels)
+2) deinterlace jobs: scatter the pixels of a range of scanlines of a pass to their
+   final positions. A deinterlace job of a pass waits until the unfilter job of that
+   pass is done, so the deinterlacing of already unfiltered passes can fill the time
+   in which the largest passes are still being unfiltered.
+All jobs read from the shared decompressed IDAT buffer and write to disjoint memory,
+so no synchronization between jobs is needed other than the per-pass unfilter flags.
+
+To make the unfilter jobs of the 7 passes fully independent, each pass is unfiltered
+in place at its own location in the decompressed buffer. The sequential code instead
+compacts each pass to a lower address, which is not possible in parallel: a pass
+would then overwrite input that a neighboring pass is still reading.
+*/
+
+/*below this amount of raw image data in bytes, the thread overhead of parallel
+Adam7 deinterlacing is not worth it and the sequential code is used instead*/
+#define LODEPNG_ADAM7_PARALLEL_MIN_BYTES 131072
+
+/*the amount of threads used for Adam7 deinterlacing is clamped to this value*/
+#define LODEPNG_ADAM7_MAX_THREADS 64
+
+/*resolves the adam7_num_threads setting: 0 means autodetect, and the value is
+clamped to a sane maximum. Returns 1 (sequential) if thread support is not compiled in.*/
+static unsigned lodepng_resolve_num_threads(unsigned num_threads) {
+#ifdef LODEPNG_ADAM7_THREADS
+  if(num_threads == 0) { /*0 means: autodetect the amount of processors*/
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    num_threads = (n >= 1) ? (unsigned)n : 1;
+  }
+  if(num_threads > LODEPNG_ADAM7_MAX_THREADS) num_threads = LODEPNG_ADAM7_MAX_THREADS;
+  return num_threads;
+#else
+  (void)num_threads;
+  return 1;
+#endif
+}
+
+#ifdef LODEPNG_ADAM7_THREADS
+
+/*a single job for lodepng_parallel_run below*/
+typedef struct LodePNGParallelJob {
+  void (*func)(void* userdata);
+  void* userdata;
+} LodePNGParallelJob;
+
+typedef struct LodePNGParallelRunner {
+  const LodePNGParallelJob* jobs;
+  size_t num_jobs;
+  size_t next; /*index of the next job to grab, incremented atomically by the workers*/
+} LodePNGParallelRunner;
+
+static void* lodepng_parallel_worker(void* userdata) {
+  LodePNGParallelRunner* runner = (LodePNGParallelRunner*)userdata;
+  for(;;) {
+    size_t i = __sync_fetch_and_add(&runner->next, 1);
+    if(i >= runner->num_jobs) break;
+    runner->jobs[i].func(runner->jobs[i].userdata);
+  }
+  return 0;
+}
+
+/*
+Runs all jobs, distributed over up to num_threads threads (including the calling
+thread). Jobs are grabbed dynamically, so ordering jobs from most to least expensive
+gives good load balance even if their costs differ a lot.
+*/
+static void lodepng_parallel_run(const LodePNGParallelJob* jobs, size_t num_jobs, unsigned num_threads) {
+  LodePNGParallelRunner runner;
+  pthread_t* threads;
+  unsigned i, num_extra;
+
+  runner.jobs = jobs;
+  runner.num_jobs = num_jobs;
+  runner.next = 0;
+
+  if(num_threads > num_jobs) num_threads = (unsigned)num_jobs;
+  num_extra = num_threads - 1; /*the calling thread also runs jobs*/
+  threads = (pthread_t*)lodepng_malloc(num_extra * sizeof(pthread_t));
+  if(!threads && num_extra != 0) {
+    /*alloc fail: fall back to running all jobs sequentially in the calling thread*/
+    lodepng_parallel_worker(&runner);
+    return;
+  }
+  for(i = 0; i != num_extra; ++i) {
+    if(pthread_create(&threads[i], 0, &lodepng_parallel_worker, &runner) != 0) break;
+  }
+  num_extra = i; /*the amount of threads actually started, these must be joined*/
+  lodepng_parallel_worker(&runner);
+  for(i = 0; i != num_extra; ++i) {
+    pthread_join(threads[i], 0);
+  }
+  lodepng_free(threads);
+}
+
+/*job for the parallel Adam7 pipeline: either unfilter one pass, or deinterlace a
+range of scanlines of one pass (the latter is only used for bpp >= 8)*/
+typedef struct Adam7Job {
+  unsigned char* out; /*the final image, each pixel is written by exactly one job*/
+  unsigned char* in; /*the shared decompressed IDAT data*/
+  const unsigned* passw;
+  const unsigned* passh;
+  const size_t* filter_passstart;
+  unsigned w, bpp;
+  volatile unsigned* pass_unfiltered; /*per-pass flags: set to 1 once a pass is unfiltered*/
+  unsigned pass; /*index (0-6) of the pass*/
+  unsigned deinterlace; /*0: unfilter the pass, 1: deinterlace rows [ybegin, yend)*/
+  unsigned ybegin, yend; /*scanline range of the reduced image (deinterlace jobs only)*/
+  unsigned error; /*out: error code of unfiltering (unfilter jobs only)*/
+} Adam7Job;
+
+static void adam7_job_run(void* userdata) {
+  Adam7Job* job = (Adam7Job*)userdata;
+  unsigned p = job->pass;
+  if(!job->deinterlace) {
+    /*unfilter the pass in place: each pass then only touches its own disjoint
+    region of the shared buffer, so the 7 passes can be unfiltered concurrently*/
+    job->error = unfilter(&job->in[job->filter_passstart[p]], &job->in[job->filter_passstart[p]],
+                          job->passw[p], job->passh[p], job->bpp);
+    __sync_synchronize(); /*the unfiltered data must be visible before the flag*/
+    job->pass_unfiltered[p] = 1;
+  } else {
+    unsigned x, y;
+    size_t bytewidth = job->bpp / 8u;
+    /*wait until the pass is unfiltered. The jobs are ordered so that this is
+    almost always already the case, so this spin is short.*/
+    while(__sync_fetch_and_add(&job->pass_unfiltered[p], 0) == 0) {}
+    if(ADAM7_IX[p] == 0 && ADAM7_DX[p] == 1) {
+      /*pass 7 covers complete contiguous output rows: copy whole rows at once*/
+      size_t rowbytes = (size_t)job->passw[p] * bytewidth;
+      for(y = job->ybegin; y != job->yend; ++y) {
+        size_t pixelinstart = job->filter_passstart[p] + (size_t)y * rowbytes;
+        size_t pixeloutstart = (size_t)(ADAM7_IY[p] + y * ADAM7_DY[p]) * (size_t)job->w * bytewidth;
+        lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], rowbytes);
+      }
+    } else {
+      for(y = job->ybegin; y != job->yend; ++y)
+      for(x = 0; x != job->passw[p]; ++x) {
+        size_t pixelinstart = job->filter_passstart[p] + ((size_t)y * job->passw[p] + x) * bytewidth;
+        size_t pixeloutstart = ((ADAM7_IY[p] + (size_t)y * ADAM7_DY[p]) * (size_t)job->w
+                             + ADAM7_IX[p] + (size_t)x * ADAM7_DX[p]) * bytewidth;
+        /*copy one pixel; the constant sizes compile to single loads and stores*/
+        switch(bytewidth) {
+          case 1: job->out[pixeloutstart] = job->in[pixelinstart]; break;
+          case 2: lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], 2); break;
+          case 3: lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], 3); break;
+          case 4: lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], 4); break;
+          case 6: lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], 6); break;
+          case 8: lodepng_memcpy(&job->out[pixeloutstart], &job->in[pixelinstart], 8); break;
+          default: /*should not happen, but keep a generic fallback*/ {
+            unsigned b;
+            for(b = 0; b != bytewidth; ++b) job->out[pixeloutstart + b] = job->in[pixelinstart + b];
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
+/*
+Parallel version of the Adam7 branch of postProcessScanlines: unfilters the 7 passes
+and deinterlaces them using up to num_threads threads. See the comment at the top of
+this section for the rationale.
+*/
+static unsigned postProcessScanlinesAdam7Parallel(unsigned char* out, unsigned char* in,
+                                                  unsigned w, unsigned h, unsigned bpp,
+                                                  unsigned num_threads) {
+  unsigned passw[7], passh[7];
+  size_t filter_passstart[8], padded_passstart[8], passstart[8];
+  /*unfilter the largest passes first: pass 7 and 6 contain about half and a quarter
+  of the pixels, so starting them first balances the load over the threads*/
+  static const unsigned unfilter_order[7] = {6, 5, 4, 3, 2, 1, 0};
+  /*deinterlace the smallest passes first, and the largest pass last: by the time the
+  deinterlace jobs run, their pass is normally unfiltered already, and the row
+  blocks of the largest pass keep all threads busy at the end*/
+  static const unsigned deinterlace_order[7] = {0, 1, 2, 3, 4, 5, 6};
+  volatile unsigned pass_unfiltered[7];
+  unsigned i;
+
+  Adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, bpp);
+
+  for(i = 0; i != 7; ++i) pass_unfiltered[i] = 0;
+
+  if(bpp >= 8) {
+    /*pipelined job queue: unfilter jobs and deinterlace row blocks*/
+    unsigned nblocks_max = num_threads * 4; /*row blocks per pass, for load balance*/
+    size_t num_jobs = 0;
+    size_t cap = 7 + 7 * (size_t)nblocks_max;
+    Adam7Job* jobs = (Adam7Job*)lodepng_malloc(cap * sizeof(Adam7Job));
+    LodePNGParallelJob* pjobs = (LodePNGParallelJob*)lodepng_malloc(cap * sizeof(LodePNGParallelJob));
+    if(!jobs || !pjobs) {
+      lodepng_free(jobs);
+      lodepng_free(pjobs);
+      return 83; /*alloc fail*/
+    }
+    for(i = 0; i != 7; ++i) {
+      Adam7Job* job = &jobs[num_jobs];
+      job->out = out;
+      job->in = in;
+      job->passw = passw;
+      job->passh = passh;
+      job->filter_passstart = filter_passstart;
+      job->w = w;
+      job->bpp = bpp;
+      job->pass_unfiltered = pass_unfiltered;
+      job->pass = unfilter_order[i];
+      job->deinterlace = 0;
+      job->ybegin = 0;
+      job->yend = 0;
+      job->error = 0;
+      pjobs[num_jobs].func = &adam7_job_run;
+      pjobs[num_jobs].userdata = job;
+      ++num_jobs;
+    }
+    for(i = 0; i != 7; ++i) {
+      unsigned p = deinterlace_order[i];
+      unsigned nblocks, rows, y;
+      if(passh[p] == 0) continue;
+      nblocks = passh[p] < nblocks_max ? passh[p] : nblocks_max;
+      rows = (passh[p] + nblocks - 1) / nblocks;
+      for(y = 0; y < passh[p]; y += rows) {
+        Adam7Job* job = &jobs[num_jobs];
+        job->out = out;
+        job->in = in;
+        job->passw = passw;
+        job->passh = passh;
+        job->filter_passstart = filter_passstart;
+        job->w = w;
+        job->bpp = bpp;
+        job->pass_unfiltered = pass_unfiltered;
+        job->pass = p;
+        job->deinterlace = 1;
+        job->ybegin = y;
+        job->yend = (y + rows < passh[p]) ? y + rows : passh[p];
+        job->error = 0;
+        pjobs[num_jobs].func = &adam7_job_run;
+        pjobs[num_jobs].userdata = job;
+        ++num_jobs;
+      }
+    }
+    lodepng_parallel_run(pjobs, num_jobs, num_threads);
+    lodepng_free(pjobs);
+    for(i = 0; i != 7; ++i) {
+      if(jobs[i].error) {
+        unsigned error = jobs[i].error;
+        lodepng_free(jobs);
+        return error;
+      }
+    }
+    lodepng_free(jobs);
+  } else /*bpp < 8*/ {
+    /*unfilter the 7 passes in parallel (7 jobs), then remove padding bits and
+    deinterlace sequentially: for bpp < 8, different passes can write to the same
+    output byte, so parallel deinterlacing would cause bit-level write races*/
+    Adam7Job jobs[7];
+    LodePNGParallelJob pjobs[7];
+    for(i = 0; i != 7; ++i) {
+      jobs[i].out = out;
+      jobs[i].in = in;
+      jobs[i].passw = passw;
+      jobs[i].passh = passh;
+      jobs[i].filter_passstart = filter_passstart;
+      jobs[i].w = w;
+      jobs[i].bpp = bpp;
+      jobs[i].pass_unfiltered = pass_unfiltered;
+      jobs[i].pass = unfilter_order[i];
+      jobs[i].deinterlace = 0;
+      jobs[i].ybegin = 0;
+      jobs[i].yend = 0;
+      jobs[i].error = 0;
+      pjobs[i].func = &adam7_job_run;
+      pjobs[i].userdata = &jobs[i];
+    }
+    lodepng_parallel_run(pjobs, 7, num_threads);
+    for(i = 0; i != 7; ++i) {
+      if(jobs[i].error) return jobs[i].error;
+    }
+    /*the passes were unfiltered in place above, so remove the padding bits of each
+    pass here (moving it to its compacted position as the sequential code does)*/
+    for(i = 0; i != 7; ++i) {
+      removePaddingBits(&in[passstart[i]], &in[filter_passstart[i]], passw[i] * bpp,
+                        ((passw[i] * bpp + 7u) / 8u) * 8u, passh[i]);
+    }
+    Adam7_deinterlace(out, in, w, h, bpp);
+  }
+
+  return 0;
+}
+
+#endif /*LODEPNG_ADAM7_THREADS*/
+
 /*out must be buffer big enough to contain full image, and in must contain the full decompressed data from
 the IDAT chunks (with filter index bytes and possible padding bits)
 return value is error*/
 static unsigned postProcessScanlines(unsigned char* out, unsigned char* in,
-                                     unsigned w, unsigned h, const LodePNGInfo* info_png) {
+                                     unsigned w, unsigned h, const LodePNGInfo* info_png,
+                                     unsigned adam7_num_threads) {
   /*
   This function converts the filtered-padded-interlaced data into pure 2D image buffer with the PNG's colortype.
   Steps:
@@ -4785,6 +5100,16 @@ static unsigned postProcessScanlines(unsigned char* out, unsigned char* in,
   } else /*interlace_method is 1 (Adam7)*/ {
     unsigned passw[7], passh[7]; size_t filter_passstart[8], padded_passstart[8], passstart[8];
     unsigned i;
+
+#ifdef LODEPNG_ADAM7_THREADS
+    /*for large enough images, unfilter and deinterlace the 7 passes in parallel*/
+    if(adam7_num_threads > 1
+       && (size_t)w * (size_t)h * (size_t)bpp / 8u >= (size_t)LODEPNG_ADAM7_PARALLEL_MIN_BYTES) {
+      return postProcessScanlinesAdam7Parallel(out, in, w, h, bpp, adam7_num_threads);
+    }
+#else
+    (void)adam7_num_threads;
+#endif
 
     Adam7_getpassvalues(passw, passh, filter_passstart, padded_passstart, passstart, w, h, bpp);
 
@@ -5523,8 +5848,12 @@ static void decodeGeneric(unsigned char** out, unsigned* w, unsigned* h,
     if(!*out) state->error = 83; /*alloc fail*/
   }
   if(!state->error) {
-    lodepng_memset(*out, 0, outsize);
-    state->error = postProcessScanlines(*out, scanlines, *w, *h, &state->info_png);
+    /*for bpp < 8 the output buffer must be zeroed first (deinterlacing then sets
+    individual bits). For bpp >= 8 every output byte is written by
+    postProcessScanlines, so zeroing the buffer is not needed there.*/
+    if(lodepng_get_bpp(&state->info_png.color) < 8) lodepng_memset(*out, 0, outsize);
+    state->error = postProcessScanlines(*out, scanlines, *w, *h, &state->info_png,
+                                        lodepng_resolve_num_threads(state->decoder.adam7_num_threads));
   }
   lodepng_free(scanlines);
 }
@@ -5625,6 +5954,7 @@ unsigned lodepng_decode24_file(unsigned char** out, unsigned* w, unsigned* h, co
 
 void lodepng_decoder_settings_init(LodePNGDecoderSettings* settings) {
   settings->color_convert = 1;
+  settings->adam7_num_threads = 1;
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
   settings->read_text_chunks = 1;
   settings->remember_unknown_chunks = 0;

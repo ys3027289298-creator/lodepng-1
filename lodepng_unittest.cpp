@@ -745,6 +745,72 @@ void doCodecTestInterlaced(Image& image) {
   assertPixels(image, &decoded[0], "Pixels interlaced");
 }
 
+//Test that parallel Adam7 deinterlacing (decoder setting adam7_num_threads) decodes
+//pixel-identical to sequential decoding of the same interlaced PNG
+void doCodecTestInterlacedThreads(Image& image, unsigned num_threads) {
+  std::vector<unsigned char> encoded;
+  std::vector<unsigned char> decoded_seq, decoded_par;
+  unsigned w_seq, h_seq, w_par, h_par;
+
+  lodepng::State state;
+  state.info_png.interlace_method = 1;
+  state.info_raw.colortype = image.colorType;
+  state.info_raw.bitdepth = image.bitDepth;
+
+  unsigned error_enc = lodepng::encode(encoded, image.data, image.width, image.height, state);
+  ASSERT_NO_PNG_ERROR_MSG(error_enc, "encoder error interlaced threads");
+
+  state.decoder.adam7_num_threads = 1; //sequential reference decode
+  unsigned error_seq = lodepng::decode(decoded_seq, w_seq, h_seq, state, encoded);
+  ASSERT_NO_PNG_ERROR_MSG(error_seq, "sequential decoder error interlaced threads");
+
+  state.decoder.adam7_num_threads = num_threads; //parallel decode
+  unsigned error_par = lodepng::decode(decoded_par, w_par, h_par, state, encoded);
+  ASSERT_NO_PNG_ERROR_MSG(error_par, "parallel decoder error interlaced threads");
+
+  ASSERT_EQUALS(w_seq, w_par);
+  ASSERT_EQUALS(h_seq, h_par);
+  ASSERT_EQUALS(decoded_seq.size(), decoded_par.size());
+  for(size_t i = 0; i < decoded_seq.size(); i++) {
+    ASSERT_EQUALS((int)decoded_seq[i], (int)decoded_par[i]);
+  }
+}
+
+//Test parallel Adam7 deinterlacing with 4 threads and with autodetected thread count,
+//on small and large images, with and without alpha, with 8 and 16 bit channels, and
+//with bpp < 8 (where deinterlacing itself stays sequential due to bit-level writes)
+void testAdam7Parallel() {
+  std::cout << "testAdam7Parallel" << std::endl;
+  unsigned sizes[4][2] = {
+    {37, 29},     //small image: below the parallel threshold, uses the sequential path
+    {701, 533},   //large image with odd dimensions
+    {640, 480},   //large image
+    {400, 301}    //medium image with odd height
+  };
+  LodePNGColorType types[4] = {LCT_RGBA, LCT_RGB, LCT_RGBA, LCT_RGBA};
+  unsigned depths[4] = {8, 8, 8, 16};
+  for(int t = 0; t < 4; t++) {
+    Image image;
+    generateTestImage(image, sizes[t][0], sizes[t][1], types[t], depths[t]);
+    doCodecTestInterlacedThreads(image, 4);
+    doCodecTestInterlacedThreads(image, 0); //0 = autodetect amount of processors
+  }
+  //bpp < 8: the passes are still unfiltered in parallel, deinterlacing is sequential
+  {
+    Image image;
+    generateTestImage(image, 1200, 900, LCT_GREY, 1);
+    doCodecTestInterlacedThreads(image, 4);
+  }
+  //extreme aspect ratios above the parallel threshold: some Adam7 passes are empty
+  {
+    Image tall, wide;
+    generateTestImage(tall, 1, 100000, LCT_RGBA, 8);
+    doCodecTestInterlacedThreads(tall, 4);
+    generateTestImage(wide, 100000, 1, LCT_RGBA, 8);
+    doCodecTestInterlacedThreads(wide, 4);
+  }
+}
+
 //Test LodePNG encoding and decoding the encoded result
 void doCodecTest(Image& image) {
   doCodecTestC(image);
@@ -3950,6 +4016,7 @@ void doMain() {
   testPngSuite();
   testErrorImages();
   testPNGCodec();
+  testAdam7Parallel();
   testPaletteFilterTypesZero();
   testComplexPNG();
   testInspectChunk();
