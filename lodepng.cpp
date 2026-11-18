@@ -6125,6 +6125,90 @@ static void filterScanline(unsigned char* out, const unsigned char* scanline, co
   }
 }
 
+/*restrict is only C99, but supported as an extension by common C and C++ compilers.
+Used here to tell the compiler the filtered output cannot alias the input scanlines,
+which allows it to vectorize the LFS_MINSUM loops. Falls back to nothing elsewhere.*/
+#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+#define LODEPNG_RESTRICT __restrict
+#else
+#define LODEPNG_RESTRICT
+#endif
+
+/*accumulate one filtered byte into out and the LFS_MINSUM sum: for difference filters
+each byte is treated as signed, values above 127 are negative and count as 255 - value*/
+#define LODEPNG_MINSUM_ADD(out, sum, i, value)\
+  {\
+    unsigned char s_ = (unsigned char)(value);\
+    (out)[i] = s_;\
+    (sum) += s_ < 128 ? s_ : (255U - s_);\
+  }
+
+/*Like filterScanline, but computes the LFS_MINSUM sum of the filtered scanline in the
+same pass instead of needing a second pass over the result. Only supports the
+difference filter types 1-4: for filter type 0 the output equals the scanline, so its
+sum can be computed from the unfiltered scanline directly.*/
+static size_t filterScanlineSum(unsigned char* LODEPNG_RESTRICT out,
+                                const unsigned char* LODEPNG_RESTRICT scanline,
+                                const unsigned char* LODEPNG_RESTRICT prevline,
+                                size_t length, size_t bytewidth, unsigned char filterType) {
+  size_t i;
+  size_t total = 0;
+  size_t i0 = 0;
+  /*Process the scanline in chunks: the per-chunk sum is 32-bit "unsigned" rather than
+  size_t because that vectorizes better, and 255 per byte cannot overflow 32 bits
+  within a chunk*/
+  while(i0 < length) {
+    /*no overflow possible: length - i0 <= length*/
+    size_t chunk = length - i0;
+    size_t end;
+    unsigned sum = 0;
+    if(chunk > (1u << 20)) chunk = 1u << 20;
+    end = i0 + chunk;
+    switch(filterType) {
+      case 1: /*Sub*/
+        for(i = i0; i < bytewidth && i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i]);
+        for(i = i0 == 0 ? bytewidth : i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - scanline[i - bytewidth]);
+        break;
+      case 2: /*Up*/
+        if(prevline) {
+          for(i = i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - prevline[i]);
+        } else {
+          for(i = i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i]);
+        }
+        break;
+      case 3: /*Average*/
+        if(prevline) {
+          for(i = i0; i < bytewidth && i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - (prevline[i] >> 1));
+          for(i = i0 == 0 ? bytewidth : i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - ((scanline[i - bytewidth] + prevline[i]) >> 1));
+        } else {
+          for(i = i0; i < bytewidth && i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i]);
+          for(i = i0 == 0 ? bytewidth : i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - (scanline[i - bytewidth] >> 1));
+        }
+        break;
+      case 4: /*Paeth*/
+        if(prevline) {
+          /*paethPredictor(0, prevline[i], 0) is always prevline[i]*/
+          for(i = i0; i < bytewidth && i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - prevline[i]);
+          for(i = i0 == 0 ? bytewidth : i0; i < end; ++i) {
+            LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - paethPredictor(scanline[i - bytewidth], prevline[i], prevline[i - bytewidth]));
+          }
+        } else {
+          for(i = i0; i < bytewidth && i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i]);
+          /*paethPredictor(scanline[i - bytewidth], 0, 0) is always scanline[i - bytewidth]*/
+          for(i = i0 == 0 ? bytewidth : i0; i < end; ++i) LODEPNG_MINSUM_ADD(out, sum, i, scanline[i] - scanline[i - bytewidth]);
+        }
+        break;
+      default: break; /*invalid filter type given*/
+    }
+    total += sum;
+    i0 = end;
+  }
+  return total;
+}
+
+#undef LODEPNG_MINSUM_ADD
+#undef LODEPNG_RESTRICT
+
 /* integer binary logarithm, max return value is 31 */
 static size_t ilog2(size_t i) {
   size_t result = 0;
@@ -6185,51 +6269,47 @@ static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, 
   } else if(strategy == LFS_MINSUM) {
     /*adaptive filtering: independently for each row, try all five filter types and select the one that produces the
     smallest sum of absolute values per row.*/
-    unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
+    unsigned char* attempt[5]; /*filtering attempts, one for each difference filter type (index 0 unused)*/
     size_t smallest = 0;
     unsigned char type, bestType = 0;
 
-    for(type = 0; type != 5; ++type) {
+    for(type = 1; type != 5; ++type) {
       attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
       if(!attempt[type]) error = 83; /*alloc fail*/
     }
 
     if(!error) {
       for(y = 0; y != h; ++y) {
-        /*try the 5 filter types*/
-        for(type = 0; type != 5; ++type) {
-          size_t sum = 0;
-          filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
+        const unsigned char* scanline = &in[y * linebytes];
+        /*filter type 0 isn't a difference, so its sum uses the unsigned byte values,
+        and can be computed from the unfiltered scanline directly without an attempt*/
+        smallest = 0;
+        for(x = 0; x != linebytes; ++x) smallest += scanline[x];
+        bestType = 0;
 
-          /*calculate the sum of the result*/
-          if(type == 0) {
-            for(x = 0; x != linebytes; ++x) sum += (unsigned char)(attempt[type][x]);
-          } else {
-            for(x = 0; x != linebytes; ++x) {
-              /*For differences, each byte should be treated as signed, values above 127 are negative
-              (converted to signed char). Filtertype 0 isn't a difference though, so use unsigned there.
-              This means filtertype 0 is almost never chosen, but that is justified.*/
-              unsigned char s = attempt[type][x];
-              sum += s < 128 ? s : (255U - s);
-            }
-          }
-
-          /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
-          if(type == 0 || sum < smallest) {
+        /*try the 4 difference filter types: filter and sum in a single pass*/
+        for(type = 1; type != 5; ++type) {
+          size_t sum = filterScanlineSum(attempt[type], scanline, prevline, linebytes, bytewidth, type);
+          /*check if this is smallest sum*/
+          if(sum < smallest) {
             bestType = type;
             smallest = sum;
           }
         }
 
-        prevline = &in[y * linebytes];
+        prevline = scanline;
 
         /*now fill the out values*/
         out[y * (linebytes + 1)] = bestType; /*the first byte of a scanline will be the filter type*/
-        for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = attempt[bestType][x];
+        if(bestType == 0) {
+          for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = scanline[x];
+        } else {
+          for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = attempt[bestType][x];
+        }
       }
     }
 
-    for(type = 0; type != 5; ++type) lodepng_free(attempt[type]);
+    for(type = 1; type != 5; ++type) lodepng_free(attempt[type]);
   } else if(strategy == LFS_ENTROPY) {
     unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
     size_t bestSum = 0;
