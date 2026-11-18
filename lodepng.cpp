@@ -6081,48 +6081,115 @@ static unsigned addChunk_sBIT(ucvector* out, const LodePNGInfo* info) {
 
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 
-static void filterScanline(unsigned char* out, const unsigned char* scanline, const unsigned char* prevline,
-                           size_t length, size_t bytewidth, unsigned char filterType) {
+/* ////////////////////////////////////////////////////////////////////////// */
+/* PNG filter type implementations and filter selection strategies          */
+/* ////////////////////////////////////////////////////////////////////////// */
+
+/*
+The encoder side of PNG filter method 0 is split into three replaceable parts:
+
+1. LodePNGFilterImpl: the implementations of the five filter types (none, sub,
+   up, average, paeth). There is exactly one function per filter type and the
+   encoder's main loop contains no filter-type-specific code anymore.
+2. LodePNGFilterChooser: the per-scanline selection strategy. The built-in
+   strategies (fixed filter type, minimum sum, minimum entropy, brute force,
+   predefined per scanline) are separate functions listed in
+   lodepng_filter_strategies; adding a new selection algorithm only requires an
+   entry there.
+3. filter(): the main loop which only calls the two interfaces above.
+
+Both interfaces are validated before use. A missing filter implementation, a
+missing selection function, or a selection function that returns an unknown
+filter type yields an error instead of silently using a default.
+*/
+
+/*One implementation of a PNG filter type. Filters a single scanline.
+out: receives length filtered bytes. Must not overlap scanline.
+scanline: the unfiltered scanline, length bytes.
+prevline: the previous unfiltered scanline, or 0 for the first scanline.
+bytewidth: 1 if bpp < 8, otherwise the amount of bytes per pixel.*/
+typedef void (*LodePNGFilterScanlineFn)(unsigned char* out,
+                                        const unsigned char* scanline,
+                                        const unsigned char* prevline,
+                                        size_t length, size_t bytewidth);
+
+static void filterScanlineNone(unsigned char* out, const unsigned char* scanline,
+                               const unsigned char* prevline, size_t length, size_t bytewidth) {
   size_t i;
-  switch(filterType) {
-    case 0: /*None*/
-      for(i = 0; i != length; ++i) out[i] = scanline[i];
-      break;
-    case 1: /*Sub*/
-      for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
-      for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - scanline[i - bytewidth];
-      break;
-    case 2: /*Up*/
-      if(prevline) {
-        for(i = 0; i != length; ++i) out[i] = scanline[i] - prevline[i];
-      } else {
-        for(i = 0; i != length; ++i) out[i] = scanline[i];
-      }
-      break;
-    case 3: /*Average*/
-      if(prevline) {
-        for(i = 0; i != bytewidth; ++i) out[i] = scanline[i] - (prevline[i] >> 1);
-        for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - ((scanline[i - bytewidth] + prevline[i]) >> 1);
-      } else {
-        for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
-        for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - (scanline[i - bytewidth] >> 1);
-      }
-      break;
-    case 4: /*Paeth*/
-      if(prevline) {
-        /*paethPredictor(0, prevline[i], 0) is always prevline[i]*/
-        for(i = 0; i != bytewidth; ++i) out[i] = (scanline[i] - prevline[i]);
-        for(i = bytewidth; i < length; ++i) {
-          out[i] = (scanline[i] - paethPredictor(scanline[i - bytewidth], prevline[i], prevline[i - bytewidth]));
-        }
-      } else {
-        for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
-        /*paethPredictor(scanline[i - bytewidth], 0, 0) is always scanline[i - bytewidth]*/
-        for(i = bytewidth; i < length; ++i) out[i] = (scanline[i] - scanline[i - bytewidth]);
-      }
-      break;
-    default: return; /*invalid filter type given*/
+  (void)prevline;
+  (void)bytewidth;
+  for(i = 0; i != length; ++i) out[i] = scanline[i];
+}
+
+static void filterScanlineSub(unsigned char* out, const unsigned char* scanline,
+                              const unsigned char* prevline, size_t length, size_t bytewidth) {
+  size_t i;
+  (void)prevline;
+  for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+  for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - scanline[i - bytewidth];
+}
+
+static void filterScanlineUp(unsigned char* out, const unsigned char* scanline,
+                             const unsigned char* prevline, size_t length, size_t bytewidth) {
+  size_t i;
+  (void)bytewidth;
+  if(prevline) {
+    for(i = 0; i != length; ++i) out[i] = scanline[i] - prevline[i];
+  } else {
+    for(i = 0; i != length; ++i) out[i] = scanline[i];
   }
+}
+
+static void filterScanlineAverage(unsigned char* out, const unsigned char* scanline,
+                                  const unsigned char* prevline, size_t length, size_t bytewidth) {
+  size_t i;
+  if(prevline) {
+    for(i = 0; i != bytewidth; ++i) out[i] = scanline[i] - (prevline[i] >> 1);
+    for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - ((scanline[i - bytewidth] + prevline[i]) >> 1);
+  } else {
+    for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+    for(i = bytewidth; i < length; ++i) out[i] = scanline[i] - (scanline[i - bytewidth] >> 1);
+  }
+}
+
+static void filterScanlinePaeth(unsigned char* out, const unsigned char* scanline,
+                                const unsigned char* prevline, size_t length, size_t bytewidth) {
+  size_t i;
+  if(prevline) {
+    /*paethPredictor(0, prevline[i], 0) is always prevline[i]*/
+    for(i = 0; i != bytewidth; ++i) out[i] = (scanline[i] - prevline[i]);
+    for(i = bytewidth; i < length; ++i) {
+      out[i] = (scanline[i] - paethPredictor(scanline[i - bytewidth], prevline[i], prevline[i - bytewidth]));
+    }
+  } else {
+    for(i = 0; i != bytewidth; ++i) out[i] = scanline[i];
+    /*paethPredictor(scanline[i - bytewidth], 0, 0) is always scanline[i - bytewidth]*/
+    for(i = bytewidth; i < length; ++i) out[i] = (scanline[i] - scanline[i - bytewidth]);
+  }
+}
+
+/*The set of implementations for the five PNG filter types, indexed by filter
+type 0..4. All five pointers must be present; see filterImplValidate.*/
+typedef struct LodePNGFilterImpl {
+  LodePNGFilterScanlineFn scanline[5];
+} LodePNGFilterImpl;
+
+static const LodePNGFilterImpl lodepng_filter_impl_default = {{
+  filterScanlineNone,
+  filterScanlineSub,
+  filterScanlineUp,
+  filterScanlineAverage,
+  filterScanlinePaeth
+}};
+
+/*Returns 0 if the filter implementation set is complete, error 88 otherwise.*/
+static unsigned filterImplValidate(const LodePNGFilterImpl* impl) {
+  unsigned type;
+  if(!impl) return 88; /*error: no filter implementation interface*/
+  for(type = 0; type != 5; ++type) {
+    if(!impl->scanline[type]) return 88; /*error: incomplete filter implementation interface*/
+  }
+  return 0;
 }
 
 /* integer binary logarithm, max return value is 31 */
@@ -6146,12 +6213,274 @@ static size_t ilog2i(size_t i) {
   return i * l + ((i - (((size_t)1) << l)) << 1u);
 }
 
+/*Input for a filter selection strategy. The chooser only chooses a filter
+type; the main loop in filter() does all filtering and output buffering.*/
+typedef struct LodePNGFilterChoiceInput {
+  const unsigned char* scanline;
+  const unsigned char* prevline; /*0 for the first scanline*/
+  size_t linebytes;
+  size_t bytewidth;
+  unsigned y; /*scanline index, used by LFS_PREDEFINED*/
+  /*Filtered candidates for types 0..4. Non-null only when the chooser has
+  needs_candidates set; the main loop fills them before calling choose.*/
+  unsigned char** candidates;
+  const LodePNGEncoderSettings* settings;
+} LodePNGFilterChoiceInput;
+
+/*A replaceable per-scanline filter selection strategy. choose writes the
+chosen filter type (0..4) to *type and returns 0, or returns an error code.
+A chooser with choose == 0 is invalid and reported as error 88.
+needs_candidates: nonzero if choose inspects the filtered candidates.*/
+typedef unsigned (*LodePNGFilterChooserFn)(void* context,
+                                           const LodePNGFilterChoiceInput* row,
+                                           unsigned char* type);
+
+typedef struct LodePNGFilterChooser {
+  unsigned needs_candidates;
+  LodePNGFilterChooserFn choose;
+  void* context;
+} LodePNGFilterChooser;
+
+/*Storage for the state of the built-in choosers. fixed_type is used by the
+LFS_ZERO..LFS_FOUR strategies, zlibsettings by LFS_BRUTE_FORCE.*/
+typedef struct LodePNGFilterChooserContext {
+  unsigned char fixed_type;
+  LodePNGCompressSettings zlibsettings;
+} LodePNGFilterChooserContext;
+
+/*fixed filter type for the whole image (LFS_ZERO .. LFS_FOUR)*/
+static unsigned filterChooseFixed(void* context, const LodePNGFilterChoiceInput* row,
+                                  unsigned char* type) {
+  const LodePNGFilterChooserContext* state = (const LodePNGFilterChooserContext*)context;
+  (void)row;
+  if(!state || state->fixed_type > 4) return 88; /*error: incomplete chooser interface*/
+  *type = state->fixed_type;
+  return 0;
+}
+
+/*adaptive filtering: independently for each row, try all five filter types and
+select the one that produces the smallest sum of absolute values per row.*/
+static unsigned filterChooseMinSum(void* context, const LodePNGFilterChoiceInput* row,
+                                   unsigned char* type) {
+  size_t smallest = 0;
+  unsigned bestType = 0;
+  unsigned t, x;
+  (void)context;
+  if(!row->candidates) return 88; /*error: chooser needs candidates but got none*/
+
+  for(t = 0; t != 5; ++t) {
+    size_t sum = 0;
+    /*calculate the sum of the result*/
+    if(t == 0) {
+      for(x = 0; x != row->linebytes; ++x) sum += (unsigned char)(row->candidates[t][x]);
+    } else {
+      for(x = 0; x != row->linebytes; ++x) {
+        /*For differences, each byte should be treated as signed, values above 127 are negative
+        (converted to signed char). Filtertype 0 isn't a difference though, so use unsigned there.
+        This means filtertype 0 is almost never chosen, but that is justified.*/
+        unsigned char s = row->candidates[t][x];
+        sum += s < 128 ? s : (255U - s);
+      }
+    }
+
+    /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
+    if(t == 0 || sum < smallest) {
+      bestType = t;
+      smallest = sum;
+    }
+  }
+
+  *type = (unsigned char)bestType;
+  return 0;
+}
+
+/*select the filter type that gives smallest Shannon entropy for this scanline*/
+static unsigned filterChooseEntropy(void* context, const LodePNGFilterChoiceInput* row,
+                                    unsigned char* type) {
+  size_t bestSum = 0;
+  unsigned bestType = 0;
+  unsigned t, x;
+  unsigned count[256];
+  (void)context;
+  if(!row->candidates) return 88; /*error: chooser needs candidates but got none*/
+
+  for(t = 0; t != 5; ++t) {
+    size_t sum = 0;
+    lodepng_memset(count, 0, 256 * sizeof(*count));
+    for(x = 0; x != row->linebytes; ++x) ++count[row->candidates[t][x]];
+    ++count[t]; /*the filter type itself is part of the scanline*/
+    for(x = 0; x != 256; ++x) {
+      sum += ilog2i(count[x]);
+    }
+    /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
+    if(t == 0 || sum > bestSum) {
+      bestType = t;
+      bestSum = sum;
+    }
+  }
+
+  *type = (unsigned char)bestType;
+  return 0;
+}
+
+/*brute force filter chooser: deflate the scanline after every filter attempt
+to see which one deflates best. This is very slow and gives only slightly
+smaller, sometimes even larger, result.*/
+static unsigned filterChooseBruteForce(void* context, const LodePNGFilterChoiceInput* row,
+                                       unsigned char* type) {
+  const LodePNGFilterChooserContext* state = (const LodePNGFilterChooserContext*)context;
+  size_t size[5];
+  size_t smallest = 0;
+  unsigned bestType = 0;
+  unsigned t;
+  unsigned char* dummy;
+  if(!state || !row->candidates) return 88; /*error: incomplete chooser interface*/
+
+  for(t = 0; t != 5; ++t) {
+    unsigned testsize = (unsigned)row->linebytes;
+    /*if(testsize > 8) testsize /= 8;*/ /*it already works good enough by testing a part of the row*/
+    size[t] = 0;
+    dummy = 0;
+    zlib_compress(&dummy, &size[t], row->candidates[t], testsize, &state->zlibsettings);
+    lodepng_free(dummy);
+    /*check if this is smallest size (or if type == 0 it's the first case so always store the values)*/
+    if(t == 0 || size[t] < smallest) {
+      bestType = t;
+      smallest = size[t];
+    }
+  }
+
+  *type = (unsigned char)bestType;
+  return 0;
+}
+
+/*use the filter type specified per scanline by settings->predefined_filters*/
+static unsigned filterChoosePredefined(void* context, const LodePNGFilterChoiceInput* row,
+                                       unsigned char* type) {
+  unsigned char t;
+  (void)context;
+  if(!row->settings || !row->settings->predefined_filters) {
+    return 88; /*error: incomplete chooser interface*/
+  }
+  t = row->settings->predefined_filters[row->y];
+  if(t > 4) return 36; /*error: invalid filter type given*/
+  *type = t;
+  return 0;
+}
+
+/*Table of the built-in selection strategies, indexed by LodePNGFilterStrategy.
+A new selection algorithm is added by writing a chooser function and adding an
+entry here; the main loop does not change.*/
+typedef struct LodePNGFilterStrategyEntry {
+  unsigned needs_candidates;
+  LodePNGFilterChooserFn choose;
+} LodePNGFilterStrategyEntry;
+
+static const LodePNGFilterStrategyEntry lodepng_filter_strategies[9] = {
+  {0, filterChooseFixed},       /*LFS_ZERO*/
+  {0, filterChooseFixed},       /*LFS_ONE*/
+  {0, filterChooseFixed},       /*LFS_TWO*/
+  {0, filterChooseFixed},       /*LFS_THREE*/
+  {0, filterChooseFixed},       /*LFS_FOUR*/
+  {1, filterChooseMinSum},      /*LFS_MINSUM*/
+  {1, filterChooseEntropy},     /*LFS_ENTROPY*/
+  {1, filterChooseBruteForce},  /*LFS_BRUTE_FORCE*/
+  {0, filterChoosePredefined}   /*LFS_PREDEFINED*/
+};
+
+/*Reads settings->filter_strategy as an unsigned integer.
+The caller may have stored a value outside the enum's range, and loading such a
+value through the enum type is undefined behavior, so copy its bytes instead.*/
+static unsigned filterStrategyRaw(const LodePNGEncoderSettings* settings) {
+  unsigned raw = 0;
+  size_t size = sizeof(settings->filter_strategy);
+  if(size > sizeof(raw)) size = sizeof(raw);
+  lodepng_memcpy(&raw, &settings->filter_strategy, size);
+  return raw;
+}
+
+/*Fills chooser for the given strategy. Returns 88 for an unknown strategy or
+an incomplete strategy interface. This never falls back to a default strategy.*/
+static unsigned filterChooserInit(LodePNGFilterChooser* chooser,
+                                  LodePNGFilterChooserContext* context,
+                                  unsigned strategy,
+                                  const LodePNGEncoderSettings* settings) {
+  unsigned index;
+  const LodePNGFilterStrategyEntry* entry;
+
+  chooser->needs_candidates = 0;
+  chooser->choose = 0;
+  chooser->context = context;
+  context->fixed_type = 0;
+
+  if(!settings) return 88;
+  index = strategy;
+  if(index > (unsigned)LFS_PREDEFINED) return 88; /*error: unknown filter strategy*/
+
+  entry = &lodepng_filter_strategies[index];
+  if(!entry->choose) return 88; /*error: incomplete strategy interface*/
+  chooser->needs_candidates = entry->needs_candidates;
+  chooser->choose = entry->choose;
+
+  if(index <= (unsigned)LFS_FOUR) context->fixed_type = (unsigned char)index;
+
+  if(index == (unsigned)LFS_PREDEFINED && !settings->predefined_filters) {
+    return 88; /*error: incomplete chooser interface*/
+  }
+
+  if(index == (unsigned)LFS_BRUTE_FORCE) {
+    lodepng_memcpy(&context->zlibsettings, &settings->zlibsettings, sizeof(LodePNGCompressSettings));
+    /*use fixed tree on the attempts so that the tree is not adapted to the filtertype on purpose,
+    to simulate the true case where the tree is the same for the whole image. Sometimes it gives
+    better result with dynamic tree anyway. Using the fixed tree sometimes gives worse, but in rare
+    cases better compression. It does make this a bit less slow, so it's worth doing this.*/
+    context->zlibsettings.btype = 1;
+    /*a custom encoder likely doesn't read the btype setting and is optimized for complete PNG
+    images only, so disable it*/
+    context->zlibsettings.custom_zlib = 0;
+    context->zlibsettings.custom_deflate = 0;
+  }
+
+  return 0;
+}
+
+#ifdef LODEPNG_TEST_FILTER_INTERFACE
+/*Test-only fault injection for the filter strategy interface. This is only
+compiled when the test suite defines LODEPNG_TEST_FILTER_INTERFACE, and lets it
+verify that a miswired interface returns an error instead of silently using a
+default. Not part of the lodepng public interface.*/
+static unsigned lodepng_test_filter_fault = 0;
+
+void lodepng_test_filter_set_fault(unsigned fault) {
+  lodepng_test_filter_fault = fault;
+}
+
+static unsigned filterTestChooseInvalidType(void* context, const LodePNGFilterChoiceInput* row,
+                                            unsigned char* type) {
+  (void)context;
+  (void)row;
+  *type = 5; /*not a valid PNG filter type*/
+  return 0;
+}
+
+static unsigned filterTestChooseError(void* context, const LodePNGFilterChoiceInput* row,
+                                      unsigned char* type) {
+  (void)context;
+  (void)row;
+  (void)type;
+  return 36;
+}
+#endif /*LODEPNG_TEST_FILTER_INTERFACE*/
+
 static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, unsigned h,
                        const LodePNGColorMode* color, const LodePNGEncoderSettings* settings) {
   /*
   For PNG filter method 0
   out must be a buffer with as size: h + (w * h * bpp + 7u) / 8u, because there are
   the scanlines with 1 extra byte per scanline
+
+  This main loop only applies the filter implementation interface for the chosen
+  type and the chooser interface for selecting that type.
   */
 
   unsigned bpp = lodepng_get_bpp(color);
@@ -6161,173 +6490,91 @@ static unsigned filter(unsigned char* out, const unsigned char* in, unsigned w, 
   /*bytewidth is used for filtering, is 1 when bpp < 8, number of bytes per pixel otherwise*/
   size_t bytewidth = (bpp + 7u) / 8u;
   const unsigned char* prevline = 0;
-  unsigned x, y;
+  unsigned y, t;
   unsigned error = 0;
-  LodePNGFilterStrategy strategy = settings->filter_strategy;
-
-  if(settings->filter_palette_zero && (color->colortype == LCT_PALETTE || color->bitdepth < 8)) {
-    /*if the filter_palette_zero setting is enabled, override the filter strategy with
-    zero for all scanlines for palette and less-than-8-bitdepth images*/
-    strategy = LFS_ZERO;
-  }
+  unsigned char* candidates[5];
+  const LodePNGFilterImpl* impl = &lodepng_filter_impl_default;
+  LodePNGFilterChooser chooser;
+  LodePNGFilterChooserContext context;
 
   if(bpp == 0) return 31; /*error: invalid color type*/
+  if(!settings) return 88; /*error: incomplete strategy interface*/
 
-  if(strategy >= LFS_ZERO && strategy <= LFS_FOUR) {
-    unsigned char type = (unsigned char)strategy;
-    for(y = 0; y != h; ++y) {
-      size_t outindex = (1 + linebytes) * y; /*the extra filterbyte added to each row*/
-      size_t inindex = linebytes * y;
-      out[outindex] = type; /*filter type byte*/
-      filterScanline(&out[outindex + 1], &in[inindex], prevline, linebytes, bytewidth, type);
-      prevline = &in[inindex];
+  for(t = 0; t != 5; ++t) candidates[t] = 0;
+
+  /*Validate the given strategy before filter_palette_zero can override it, so a
+  misconfigured strategy is reported instead of being silently treated as zero.*/
+  {
+    unsigned strategy = filterStrategyRaw(settings);
+    if(strategy > (unsigned)LFS_PREDEFINED) return 88;
+    if(settings->filter_palette_zero && (color->colortype == LCT_PALETTE || color->bitdepth < 8)) {
+      /*if the filter_palette_zero setting is enabled, override the filter strategy with
+      zero for all scanlines for palette and less-than-8-bitdepth images*/
+      error = filterChooserInit(&chooser, &context, (unsigned)LFS_ZERO, settings);
+    } else {
+      error = filterChooserInit(&chooser, &context, strategy, settings);
     }
-  } else if(strategy == LFS_MINSUM) {
-    /*adaptive filtering: independently for each row, try all five filter types and select the one that produces the
-    smallest sum of absolute values per row.*/
-    unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
-    size_t smallest = 0;
-    unsigned char type, bestType = 0;
-
-    for(type = 0; type != 5; ++type) {
-      attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
-      if(!attempt[type]) error = 83; /*alloc fail*/
-    }
-
-    if(!error) {
-      for(y = 0; y != h; ++y) {
-        /*try the 5 filter types*/
-        for(type = 0; type != 5; ++type) {
-          size_t sum = 0;
-          filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
-
-          /*calculate the sum of the result*/
-          if(type == 0) {
-            for(x = 0; x != linebytes; ++x) sum += (unsigned char)(attempt[type][x]);
-          } else {
-            for(x = 0; x != linebytes; ++x) {
-              /*For differences, each byte should be treated as signed, values above 127 are negative
-              (converted to signed char). Filtertype 0 isn't a difference though, so use unsigned there.
-              This means filtertype 0 is almost never chosen, but that is justified.*/
-              unsigned char s = attempt[type][x];
-              sum += s < 128 ? s : (255U - s);
-            }
-          }
-
-          /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
-          if(type == 0 || sum < smallest) {
-            bestType = type;
-            smallest = sum;
-          }
-        }
-
-        prevline = &in[y * linebytes];
-
-        /*now fill the out values*/
-        out[y * (linebytes + 1)] = bestType; /*the first byte of a scanline will be the filter type*/
-        for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = attempt[bestType][x];
-      }
-    }
-
-    for(type = 0; type != 5; ++type) lodepng_free(attempt[type]);
-  } else if(strategy == LFS_ENTROPY) {
-    unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
-    size_t bestSum = 0;
-    unsigned type, bestType = 0;
-    unsigned count[256];
-
-    for(type = 0; type != 5; ++type) {
-      attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
-      if(!attempt[type]) error = 83; /*alloc fail*/
-    }
-
-    if(!error) {
-      for(y = 0; y != h; ++y) {
-        /*try the 5 filter types*/
-        for(type = 0; type != 5; ++type) {
-          size_t sum = 0;
-          filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
-          lodepng_memset(count, 0, 256 * sizeof(*count));
-          for(x = 0; x != linebytes; ++x) ++count[attempt[type][x]];
-          ++count[type]; /*the filter type itself is part of the scanline*/
-          for(x = 0; x != 256; ++x) {
-            sum += ilog2i(count[x]);
-          }
-          /*check if this is smallest sum (or if type == 0 it's the first case so always store the values)*/
-          if(type == 0 || sum > bestSum) {
-            bestType = type;
-            bestSum = sum;
-          }
-        }
-
-        prevline = &in[y * linebytes];
-
-        /*now fill the out values*/
-        out[y * (linebytes + 1)] = bestType; /*the first byte of a scanline will be the filter type*/
-        for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = attempt[bestType][x];
-      }
-    }
-
-    for(type = 0; type != 5; ++type) lodepng_free(attempt[type]);
-  } else if(strategy == LFS_PREDEFINED) {
-    for(y = 0; y != h; ++y) {
-      size_t outindex = (1 + linebytes) * y; /*the extra filterbyte added to each row*/
-      size_t inindex = linebytes * y;
-      unsigned char type = settings->predefined_filters[y];
-      out[outindex] = type; /*filter type byte*/
-      filterScanline(&out[outindex + 1], &in[inindex], prevline, linebytes, bytewidth, type);
-      prevline = &in[inindex];
-    }
-  } else if(strategy == LFS_BRUTE_FORCE) {
-    /*brute force filter chooser.
-    deflate the scanline after every filter attempt to see which one deflates best.
-    This is very slow and gives only slightly smaller, sometimes even larger, result*/
-    size_t size[5];
-    unsigned char* attempt[5]; /*five filtering attempts, one for each filter type*/
-    size_t smallest = 0;
-    unsigned type = 0, bestType = 0;
-    unsigned char* dummy;
-    LodePNGCompressSettings zlibsettings;
-    lodepng_memcpy(&zlibsettings, &settings->zlibsettings, sizeof(LodePNGCompressSettings));
-    /*use fixed tree on the attempts so that the tree is not adapted to the filtertype on purpose,
-    to simulate the true case where the tree is the same for the whole image. Sometimes it gives
-    better result with dynamic tree anyway. Using the fixed tree sometimes gives worse, but in rare
-    cases better compression. It does make this a bit less slow, so it's worth doing this.*/
-    zlibsettings.btype = 1;
-    /*a custom encoder likely doesn't read the btype setting and is optimized for complete PNG
-    images only, so disable it*/
-    zlibsettings.custom_zlib = 0;
-    zlibsettings.custom_deflate = 0;
-    for(type = 0; type != 5; ++type) {
-      attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
-      if(!attempt[type]) error = 83; /*alloc fail*/
-    }
-    if(!error) {
-      for(y = 0; y != h; ++y) /*try the 5 filter types*/ {
-        for(type = 0; type != 5; ++type) {
-          unsigned testsize = (unsigned)linebytes;
-          /*if(testsize > 8) testsize /= 8;*/ /*it already works good enough by testing a part of the row*/
-
-          filterScanline(attempt[type], &in[y * linebytes], prevline, linebytes, bytewidth, type);
-          size[type] = 0;
-          dummy = 0;
-          zlib_compress(&dummy, &size[type], attempt[type], testsize, &zlibsettings);
-          lodepng_free(dummy);
-          /*check if this is smallest size (or if type == 0 it's the first case so always store the values)*/
-          if(type == 0 || size[type] < smallest) {
-            bestType = type;
-            smallest = size[type];
-          }
-        }
-        prevline = &in[y * linebytes];
-        out[y * (linebytes + 1)] = bestType; /*the first byte of a scanline will be the filter type*/
-        for(x = 0; x != linebytes; ++x) out[y * (linebytes + 1) + 1 + x] = attempt[bestType][x];
-      }
-    }
-    for(type = 0; type != 5; ++type) lodepng_free(attempt[type]);
   }
-  else return 88; /* unknown filter strategy */
+  if(error) return error;
 
+#ifdef LODEPNG_TEST_FILTER_INTERFACE
+  if(lodepng_test_filter_fault == 1) impl = 0; /*missing implementation table*/
+  else if(lodepng_test_filter_fault == 2) chooser.choose = 0; /*missing selection function*/
+  else if(lodepng_test_filter_fault == 3) chooser.choose = filterTestChooseInvalidType;
+  else if(lodepng_test_filter_fault == 4) chooser.choose = filterTestChooseError;
+#endif /*LODEPNG_TEST_FILTER_INTERFACE*/
+
+  error = filterImplValidate(impl);
+  if(error) return error;
+  if(!chooser.choose) return 88; /*error: incomplete strategy interface*/
+
+  if(chooser.needs_candidates) {
+    for(t = 0; t != 5; ++t) {
+      candidates[t] = (unsigned char*)lodepng_malloc(linebytes);
+      if(!candidates[t]) error = 83; /*alloc fail*/
+    }
+    if(error) {
+      for(t = 0; t != 5; ++t) lodepng_free(candidates[t]);
+      return error;
+    }
+  }
+
+  for(y = 0; y != h; ++y) {
+    size_t outindex = (1 + linebytes) * y; /*the extra filterbyte added to each row*/
+    unsigned char bestType = 0;
+    LodePNGFilterChoiceInput row;
+
+    row.scanline = &in[linebytes * y];
+    row.prevline = prevline;
+    row.linebytes = linebytes;
+    row.bytewidth = bytewidth;
+    row.y = y;
+    row.candidates = chooser.needs_candidates ? candidates : 0;
+    row.settings = settings;
+
+    if(chooser.needs_candidates) {
+      for(t = 0; t != 5; ++t) {
+        impl->scanline[t](candidates[t], row.scanline, row.prevline, linebytes, bytewidth);
+      }
+    }
+
+    error = chooser.choose(chooser.context, &row, &bestType);
+    if(error) break;
+    if(bestType > 4) {
+      error = 88; /*error: chooser returned an invalid filter type*/
+      break;
+    }
+
+    out[outindex] = bestType; /*the first byte of a scanline will be the filter type*/
+    if(chooser.needs_candidates) {
+      lodepng_memcpy(&out[outindex + 1], candidates[bestType], linebytes);
+    } else {
+      impl->scanline[bestType](&out[outindex + 1], row.scanline, row.prevline, linebytes, bytewidth);
+    }
+    prevline = row.scanline;
+  }
+
+  for(t = 0; t != 5; ++t) lodepng_free(candidates[t]);
   return error;
 }
 
