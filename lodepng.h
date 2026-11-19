@@ -369,6 +369,18 @@ struct LodePNGCompressSettings /*deflate = compress*/ {
                              const LodePNGCompressSettings*);
 
   const void* custom_context; /*optional custom settings for custom functions*/
+
+  /*multi-pass iterative optimal compression (PNG IDAT only, see lodepng_encode). When enabled,
+  the encoder runs several compression passes on the scanlines. Each pass measures the real
+  deflate bitstream of the previous pass (match rate, match length, zero-byte rate, resulting
+  size), updates a per-filter-type cost model used to select one of the five PNG row filters,
+  and adjusts the LZ77 matching strategy, keeping the smallest stream. The PNG format and the
+  decoder are unchanged: output stays a standard zlib/deflate stream that any decoder reads.
+  Default: disabled (0), so the classic single-pass encoder behavior is preserved.*/
+  unsigned multipass;        /*1: use the iterative multi-pass encoder, 0: classic encoder*/
+  unsigned multipass_passes; /*maximum number of iterations to run (clamped to >= 2 when enabled)*/
+  unsigned parallel_jobs;    /*thread count for block-parallel deflate (1 = serial). The spliced
+  result of parallel execution is always byte-for-byte identical to serial execution.*/
 };
 
 extern const LodePNGCompressSettings lodepng_default_compress_settings;

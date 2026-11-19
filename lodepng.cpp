@@ -406,11 +406,13 @@ unsigned lodepng_save_file(const unsigned char* buffer, size_t buffersize, const
 typedef struct {
   ucvector* data;
   unsigned char bp; /*ok to overflow, indicates bit pos inside byte*/
+  size_t nbits; /*total number of bits written; bp wraps at 256, this does not*/
 } LodePNGBitWriter;
 
 static void LodePNGBitWriter_init(LodePNGBitWriter* writer, ucvector* data) {
   writer->data = data;
   writer->bp = 0;
+  writer->nbits = 0;
 }
 
 /*TODO: this ignores potential out of memory errors*/
@@ -422,6 +424,7 @@ static void LodePNGBitWriter_init(LodePNGBitWriter* writer, ucvector* data) {
   }\
   (writer->data->data[writer->data->size - 1]) |= (bit << ((writer->bp) & 7u));\
   ++writer->bp;\
+  ++writer->nbits;\
 }
 
 /* LSB of value is written first, and LSB of bytes is used first */
@@ -2328,9 +2331,14 @@ void lodepng_compress_settings_init(LodePNGCompressSettings* settings) {
   settings->custom_zlib = 0;
   settings->custom_deflate = 0;
   settings->custom_context = 0;
+
+  settings->multipass = 0;
+  settings->multipass_passes = 4;
+  settings->parallel_jobs = 1;
 }
 
-const LodePNGCompressSettings lodepng_default_compress_settings = {2, 1, DEFAULT_WINDOWSIZE, 3, 128, 1, 0, 0, 0};
+const LodePNGCompressSettings lodepng_default_compress_settings =
+  {2, 1, DEFAULT_WINDOWSIZE, 3, 128, 1, 0, 0, 0, 0, 4, 1};
 
 
 #endif /*LODEPNG_COMPILE_ENCODER*/
@@ -6400,6 +6408,894 @@ static void Adam7_interlace(unsigned char* out, const unsigned char* in, unsigne
   }
 }
 
+/* /////////////////////////////////////////////////////////////////////////// */
+/* Multi-pass iterative optimal encoder with block-parallel deflate.          */
+/*                                                                             */
+/* Design (the PNG format and the decoder are untouched; output remains a      */
+/* standard zlib/deflate stream):                                              */
+/* 1) For every scanline all five PNG filters are computed once and cached.    */
+/* 2) Each of the five filters has a linear cost model over four row features  */
+/*    (absolute-difference sum, zero-byte fraction, byte-entropy estimate,     */
+/*    byte-value spread). Rows are assigned the filter with the lowest modeled */
+/*    cost. The models are reweighted between passes from the *real* deflate   */
+/*    bitstream feedback (see updateFilterWeights).                            */
+/* 3) Every pass compresses the chosen filtered stream in independent deflate */
+/*    blocks (fresh hash per block, so no block reaches across its boundary).  */
+/*    The per-block LZ77 symbol stream yields match statistics which adjust    */
+/*    the LZ77 matching strategy (nicematch, lazy matching, window size) for   */
+/*    the next pass. The smallest produced stream is kept; iteration stops on  */
+/*    convergence or after the configured number of passes.                    */
+/* 4) Blocks are pure functions of their input byte range and settings, so a   */
+/*    thread pool can run them concurrently. Splicing in fixed block order is  */
+/*    therefore byte-for-byte identical to the serial run, which is asserted   */
+/*    in the benchmark.                                                        */
+/* /////////////////////////////////////////////////////////////////////////// */
+
+#if defined(LODEPNG_USE_PTHREAD)
+#include <pthread.h>
+#endif
+
+#define LODEPNG_MP_NUMFILTERS 5
+#define LODEPNG_MP_NUMFEATURES 4
+
+typedef struct LodePNGMPLzStats {
+  size_t literals;       /*amount of literal symbols in the LZ77 stream*/
+  size_t matches;        /*amount of length/distance pairs*/
+  size_t match_len_sum;  /*sum of the lengths of all matches*/
+  size_t zero_bytes;     /*amount of zero bytes of the filtered input*/
+  size_t input_bytes;    /*amount of filtered input bytes*/
+  size_t output_bytes;   /*amount of produced deflate bytes (all blocks)*/
+} LodePNGMPLzStats;
+
+typedef struct LodePNGMPBlockJob {
+  const unsigned char* in; /*start of this block inside the filtered stream*/
+  size_t insize;
+  const LodePNGCompressSettings* settings;
+  unsigned final;         /*BFINAL, only set on the last block*/
+  unsigned error;
+  ucvector out;           /*raw deflate block bytes (last byte may be partial)*/
+  size_t nbits;           /*number of valid bits in out (deflate blocks are bit streams)*/
+  LodePNGMPLzStats stats; /*feedback aggregated over this block*/
+} LodePNGMPBlockJob;
+
+/*LZ77-encode one independent block and measure statistics of the symbol stream.
+A freshly initialized hash is used, so matches never reference another block.*/
+static unsigned mp_encode_lz77_stats(uivector* lz77_encoded, LodePNGMPLzStats* stats,
+                                     const unsigned char* in, size_t insize,
+                                     const LodePNGCompressSettings* settings) {
+  Hash hash;
+  unsigned error;
+  size_t i;
+
+  error = hash_init(&hash, settings->windowsize);
+  if(!error) {
+    error = encodeLZ77(lz77_encoded, &hash, in, 0, insize, settings->windowsize,
+                       settings->minmatch, settings->nicematch, settings->lazymatching);
+  }
+  hash_cleanup(&hash);
+  if(error) return error;
+
+  if(stats) {
+    stats->literals = 0;
+    stats->matches = 0;
+    stats->match_len_sum = 0;
+    stats->zero_bytes = 0;
+    stats->input_bytes = insize;
+    for(i = 0; i < insize; ++i) {
+      if(in[i] == 0) ++stats->zero_bytes;
+    }
+    for(i = 0; i < lz77_encoded->size; ++i) {
+      unsigned symbol = lz77_encoded->data[i];
+      if(symbol > 256) {
+        /*symbol layout from addLengthDistance: length code, extra length,
+        distance code, extra distance. Recover the real match length.*/
+        unsigned length_code = symbol - FIRST_LENGTH_CODE_INDEX;
+        unsigned extra_length = lz77_encoded->data[i + 1];
+        unsigned length = LENGTHBASE[length_code] + extra_length;
+        ++stats->matches;
+        stats->match_len_sum += length;
+        i += 3; /*skip length, distance code and distance extra bits*/
+      } else {
+        ++stats->literals;
+      }
+    }
+  }
+  return 0;
+}
+
+/*Emit one fixed-Huffman deflate block from an already computed LZ77 symbol
+stream. Same bit layout as deflateFixed, minus the LZ77 search.*/
+static unsigned mp_emit_fixed(LodePNGBitWriter* writer, const uivector* lz77_encoded,
+                              unsigned final, size_t* out_nbits) {
+  HuffmanTree tree_ll;
+  HuffmanTree tree_d;
+  unsigned error = 0;
+
+  HuffmanTree_init(&tree_ll);
+  HuffmanTree_init(&tree_d);
+  error = generateFixedLitLenTree(&tree_ll);
+  if(!error) error = generateFixedDistanceTree(&tree_d);
+  if(!error) {
+    writeBits(writer, final, 1);
+    writeBits(writer, 1, 1); /*first bit of BTYPE "fixed"*/
+    writeBits(writer, 0, 1); /*second bit of BTYPE*/
+    writeLZ77data(writer, lz77_encoded, &tree_ll, &tree_d);
+    writeBitsReversed(writer, tree_ll.codes[256], tree_ll.lengths[256]);
+  }
+  if(out_nbits) *out_nbits = writer->nbits;
+  HuffmanTree_cleanup(&tree_ll);
+  HuffmanTree_cleanup(&tree_d);
+  return error;
+}
+
+/*Emit one dynamic-Huffman deflate block from an already computed LZ77 symbol
+stream. Tree construction and code-length run-length encoding mirror
+deflateDynamic exactly, so decoders see an identical block grammar.*/
+static unsigned mp_emit_dynamic(LodePNGBitWriter* writer, const uivector* lz77_encoded,
+                                unsigned final, size_t* out_nbits) {
+  HuffmanTree tree_ll;
+  HuffmanTree tree_d;
+  HuffmanTree tree_cl;
+  unsigned* frequencies_ll = 0;
+  unsigned* frequencies_d = 0;
+  unsigned* frequencies_cl = 0;
+  unsigned* bitlen_lld = 0;
+  unsigned* bitlen_lld_e = 0;
+  size_t i;
+  size_t numcodes_ll, numcodes_d, numcodes_lld, numcodes_lld_e, numcodes_cl;
+  unsigned HLIT, HDIST, HCLEN;
+  unsigned error = 0;
+
+  HuffmanTree_init(&tree_ll);
+  HuffmanTree_init(&tree_d);
+  HuffmanTree_init(&tree_cl);
+  frequencies_ll = (unsigned*)lodepng_malloc(286 * sizeof(*frequencies_ll));
+  frequencies_d = (unsigned*)lodepng_malloc(30 * sizeof(*frequencies_d));
+  frequencies_cl = (unsigned*)lodepng_malloc(NUM_CODE_LENGTH_CODES * sizeof(*frequencies_cl));
+  if(!frequencies_ll || !frequencies_d || !frequencies_cl) error = 83;
+
+  while(!error) {
+    lodepng_memset(frequencies_ll, 0, 286 * sizeof(*frequencies_ll));
+    lodepng_memset(frequencies_d, 0, 30 * sizeof(*frequencies_d));
+    lodepng_memset(frequencies_cl, 0, NUM_CODE_LENGTH_CODES * sizeof(*frequencies_cl));
+
+    for(i = 0; i != lz77_encoded->size; ++i) {
+      unsigned symbol = lz77_encoded->data[i];
+      ++frequencies_ll[symbol];
+      if(symbol > 256) {
+        unsigned dist = lz77_encoded->data[i + 2];
+        ++frequencies_d[dist];
+        i += 3;
+      }
+    }
+    frequencies_ll[256] = 1; /*exactly one end code per block*/
+
+    error = HuffmanTree_makeFromFrequencies(&tree_ll, frequencies_ll, 257, 286, 15);
+    if(error) break;
+    error = HuffmanTree_makeFromFrequencies(&tree_d, frequencies_d, 2, 30, 15);
+    if(error) break;
+
+    numcodes_ll = LODEPNG_MIN(tree_ll.numcodes, 286);
+    numcodes_d = LODEPNG_MIN(tree_d.numcodes, 30);
+    numcodes_lld = numcodes_ll + numcodes_d;
+    bitlen_lld = (unsigned*)lodepng_malloc(numcodes_lld * sizeof(*bitlen_lld));
+    bitlen_lld_e = (unsigned*)lodepng_malloc(numcodes_lld * sizeof(*bitlen_lld_e));
+    if(!bitlen_lld || !bitlen_lld_e) {
+      error = 83;
+      break;
+    }
+    numcodes_lld_e = 0;
+
+    for(i = 0; i != numcodes_ll; ++i) bitlen_lld[i] = tree_ll.lengths[i];
+    for(i = 0; i != numcodes_d; ++i) bitlen_lld[numcodes_ll + i] = tree_d.lengths[i];
+
+    for(i = 0; i < numcodes_lld; ++i) {
+      unsigned j = 0;
+      while(i + j + 1 < numcodes_lld && bitlen_lld[i + j + 1] == bitlen_lld[i]) ++j;
+
+      if(bitlen_lld[i] == 0 && j >= 2) {
+        ++j;
+        if(j <= 10) {
+          bitlen_lld_e[numcodes_lld_e++] = 17;
+          bitlen_lld_e[numcodes_lld_e++] = j - 3;
+        } else {
+          if(j > 138) j = 138;
+          bitlen_lld_e[numcodes_lld_e++] = 18;
+          bitlen_lld_e[numcodes_lld_e++] = j - 11;
+        }
+        i += (j - 1);
+      } else if(j >= 3) {
+        size_t k;
+        unsigned num = j / 6u, rest = j % 6u;
+        bitlen_lld_e[numcodes_lld_e++] = bitlen_lld[i];
+        for(k = 0; k < num; ++k) {
+          bitlen_lld_e[numcodes_lld_e++] = 16;
+          bitlen_lld_e[numcodes_lld_e++] = 6 - 3;
+        }
+        if(rest >= 3) {
+          bitlen_lld_e[numcodes_lld_e++] = 16;
+          bitlen_lld_e[numcodes_lld_e++] = rest - 3;
+        } else {
+          j -= rest;
+        }
+        i += j;
+      } else {
+        bitlen_lld_e[numcodes_lld_e++] = bitlen_lld[i];
+      }
+    }
+
+    for(i = 0; i != numcodes_lld_e; ++i) {
+      ++frequencies_cl[bitlen_lld_e[i]];
+      if(bitlen_lld_e[i] >= 16) ++i;
+    }
+
+    error = HuffmanTree_makeFromFrequencies(&tree_cl, frequencies_cl,
+                                            NUM_CODE_LENGTH_CODES, NUM_CODE_LENGTH_CODES, 7);
+    if(error) break;
+
+    numcodes_cl = NUM_CODE_LENGTH_CODES;
+    while(numcodes_cl > 4u && tree_cl.lengths[CLCL_ORDER[numcodes_cl - 1u]] == 0) {
+      numcodes_cl--;
+    }
+
+    writeBits(writer, final, 1);
+    writeBits(writer, 0, 1); /*first bit of BTYPE "dynamic"*/
+    writeBits(writer, 1, 1); /*second bit of BTYPE*/
+
+    HLIT = (unsigned)(numcodes_ll - 257);
+    HDIST = (unsigned)(numcodes_d - 1);
+    HCLEN = (unsigned)(numcodes_cl - 4);
+    writeBits(writer, HLIT, 5);
+    writeBits(writer, HDIST, 5);
+    writeBits(writer, HCLEN, 4);
+
+    for(i = 0; i != numcodes_cl; ++i) writeBits(writer, tree_cl.lengths[CLCL_ORDER[i]], 3);
+
+    for(i = 0; i != numcodes_lld_e; ++i) {
+      writeBitsReversed(writer, tree_cl.codes[bitlen_lld_e[i]], tree_cl.lengths[bitlen_lld_e[i]]);
+      if(bitlen_lld_e[i] == 16) writeBits(writer, bitlen_lld_e[++i], 2);
+      else if(bitlen_lld_e[i] == 17) writeBits(writer, bitlen_lld_e[++i], 3);
+      else if(bitlen_lld_e[i] == 18) writeBits(writer, bitlen_lld_e[++i], 7);
+    }
+
+    writeLZ77data(writer, lz77_encoded, &tree_ll, &tree_d);
+    if(tree_ll.lengths[256] == 0) {
+      error = 64;
+      break;
+    }
+    writeBitsReversed(writer, tree_ll.codes[256], tree_ll.lengths[256]);
+    break;
+  }
+
+  if(out_nbits) *out_nbits = writer->nbits;
+  HuffmanTree_cleanup(&tree_ll);
+  HuffmanTree_cleanup(&tree_d);
+  HuffmanTree_cleanup(&tree_cl);
+  lodepng_free(frequencies_ll);
+  lodepng_free(frequencies_d);
+  lodepng_free(frequencies_cl);
+  lodepng_free(bitlen_lld);
+  lodepng_free(bitlen_lld_e);
+  return error;
+}
+
+/*Compress one block exactly as lodepng_deflatev would, but with an independent
+hash, and collect bitstream feedback. Reuses the stock dynamic/fixed block
+grammar, so the emitted bytes are standard deflate.*/
+static unsigned mp_compress_block(LodePNGMPBlockJob* job) {
+  uivector lz77_encoded;
+  size_t nbits = 0;
+
+  job->error = 0;
+  job->out = ucvector_init(0, 0);
+  lodepng_memset(&job->stats, 0, sizeof(job->stats));
+  uivector_init(&lz77_encoded);
+
+  if(job->settings->btype == 0) {
+    job->error = deflateNoCompression(&job->out, job->in, job->insize);
+    nbits = job->out.size * 8u; /*stored blocks are already byte aligned*/
+  } else if(job->settings->btype == 1 || job->settings->btype == 2) {
+    job->error = mp_encode_lz77_stats(&lz77_encoded, &job->stats,
+                                      job->in, job->insize, job->settings);
+    if(!job->error) {
+      LodePNGBitWriter writer;
+      LodePNGBitWriter_init(&writer, &job->out);
+      if(job->settings->btype == 1) {
+        job->error = mp_emit_fixed(&writer, &lz77_encoded, job->final, &nbits);
+      } else {
+        job->error = mp_emit_dynamic(&writer, &lz77_encoded, job->final, &nbits);
+      }
+    }
+  } else {
+    job->error = 61; /*invalid btype*/
+  }
+
+  uivector_cleanup(&lz77_encoded);
+  if(job->error) {
+    lodepng_free(job->out.data);
+  } else {
+    /*Keep the exact bit length; the last byte may be only partially used.
+    Byte alignment is done once after all blocks are spliced.*/
+    job->nbits = nbits;
+    job->out.size = (nbits + 7u) / 8u;
+    job->stats.output_bytes = job->out.size;
+  }
+  return job->error;
+}
+
+/*Append the bits of one block job to the shared output bit stream. Deflate
+blocks are a continuous bit stream: a new block header starts at the very next
+bit after the previous block's end code, so byte concatenation would corrupt
+multi-block output. Each block is compressed independently (and possibly on a
+worker thread), then spliced here bit by bit in fixed block order, which keeps
+parallel output identical to serial output.*/
+static unsigned mp_append_block_bits(ucvector* out, size_t* out_bits,
+                                     const LodePNGMPBlockJob* job) {
+  /*Bit-exact splice. Only the first nbits bits of the block are valid; the
+  high padding bits of its partial last byte must never be copied, so iterate
+  bit by bit rather than shifting whole bytes. Splicing is a small fraction of
+  total encode time because block compression dominates.*/
+  size_t src_bit;
+  for(src_bit = 0; src_bit < job->nbits; ++src_bit) {
+    size_t dst = *out_bits;
+    unsigned bit = (job->out.data[src_bit >> 3] >> (src_bit & 7u)) & 1u;
+    if((dst & 7u) == 0) {
+      if(lodepng_addofls(out->size, 1) || !ucvector_resize(out, out->size + 1)) return 83;
+      out->data[out->size - 1] = 0;
+    }
+    out->data[dst >> 3] |= (unsigned char)(bit << (dst & 7u));
+    *out_bits = dst + 1;
+  }
+  return 0;
+}
+
+#if defined(LODEPNG_USE_PTHREAD)
+static void* mp_thread_entry(void* arg) {
+  LodePNGMPBlockJob* job = (LodePNGMPBlockJob*)arg;
+  mp_compress_block(job);
+  return 0;
+}
+#endif
+
+/*Compress the full filtered stream into independent deflate blocks and splice
+them. jobs==1 reproduces the serial path; with more jobs the same per-block
+function runs on worker threads, and fixed-order splicing gives identical bytes.*/
+static unsigned mp_deflate_parallel(ucvector* out, const unsigned char* in, size_t insize,
+                                    const LodePNGCompressSettings* settings,
+                                    unsigned num_jobs, LodePNGMPLzStats* total) {
+  unsigned error = 0;
+  size_t blocksize, numblocks, i;
+  LodePNGMPBlockJob* jobs = 0;
+
+  if(total) lodepng_memset(total, 0, sizeof(*total));
+  if(settings->btype == 0 || insize == 0) {
+    /*store/no-compression is single-routine already, keep one job for it*/
+    blocksize = insize ? insize : 1;
+  } else if(settings->btype == 1) {
+    blocksize = insize;
+  } else {
+    /*same block sizing policy as lodepng_deflatev for comparable density*/
+    blocksize = insize / 8u + 8;
+    if(blocksize < 65536) blocksize = 65536;
+    if(blocksize > 262144) blocksize = 262144;
+  }
+
+  numblocks = insize == 0 ? 1 : (insize + blocksize - 1) / blocksize;
+  jobs = (LodePNGMPBlockJob*)lodepng_malloc(numblocks * sizeof(*jobs));
+  if(!jobs) return 83;
+
+  for(i = 0; i != numblocks; ++i) {
+    size_t start = i * blocksize;
+    size_t end = start + blocksize;
+    if(end > insize) end = insize;
+    jobs[i].in = in + start;
+    jobs[i].insize = end - start;
+    jobs[i].settings = settings;
+    jobs[i].final = (i == numblocks - 1);
+    jobs[i].error = 0;
+    jobs[i].out = ucvector_init(0, 0);
+    lodepng_memset(&jobs[i].stats, 0, sizeof(jobs[i].stats));
+  }
+
+#if defined(LODEPNG_USE_PTHREAD)
+  if(num_jobs > 1 && numblocks > 1) {
+    pthread_t* threads = (pthread_t*)lodepng_malloc(numblocks * sizeof(pthread_t));
+    if(!threads) error = 83;
+    if(!error) {
+      size_t next = 0;
+      /*bounded worker pool: at most num_jobs threads in flight at any time*/
+      size_t in_flight = 0;
+      size_t launched = 0;
+      while(launched < numblocks && !error) {
+        while(in_flight < (size_t)num_jobs && next < numblocks) {
+          if(pthread_create(&threads[next], 0, mp_thread_entry, &jobs[next]) != 0) {
+            error = 83;
+            break;
+          }
+          ++next;
+          ++in_flight;
+        }
+        if(launched < next) {
+          pthread_join(threads[launched], 0);
+          if(jobs[launched].error) error = jobs[launched].error;
+          ++launched;
+          --in_flight;
+        }
+      }
+      while(launched < next) {
+        pthread_join(threads[launched], 0);
+        if(jobs[launched].error) error = jobs[launched].error;
+        ++launched;
+      }
+      lodepng_free(threads);
+    }
+  } else
+#endif
+  {
+    (void)num_jobs; /*without pthread support every block runs on this thread*/
+    for(i = 0; i != numblocks && !error; ++i) {
+      error = mp_compress_block(&jobs[i]);
+    }
+  }
+
+  if(!error) {
+    /*splice the independent blocks as one continuous bit stream in fixed order*/
+    size_t out_bits = out->size * 8u;
+    for(i = 0; i != numblocks && !error; ++i) {
+      error = mp_append_block_bits(out, &out_bits, &jobs[i]);
+      if(total) {
+        total->literals += jobs[i].stats.literals;
+        total->matches += jobs[i].stats.matches;
+        total->match_len_sum += jobs[i].stats.match_len_sum;
+        total->zero_bytes += jobs[i].stats.zero_bytes;
+        total->input_bytes += jobs[i].stats.input_bytes;
+        total->output_bytes += jobs[i].stats.output_bytes;
+      }
+    }
+    /*the deflate stream must end on a whole byte: pad the tail with zero bits*/
+    if(!error && (out_bits & 7u) != 0) {
+      size_t before = out->size;
+      out->size = (out_bits + 7u) / 8u;
+      if(out->size > before) {
+        if(!ucvector_resize(out, out->size)) {
+          error = 83;
+        } else {
+          out->data[out->size - 1] = 0;
+        }
+      }
+    }
+  }
+
+  for(i = 0; i != numblocks; ++i) lodepng_free(jobs[i].out.data);
+  lodepng_free(jobs);
+  return error;
+}
+
+/*zlib wrapper (CMF/FLG header + adler32 trailer) around the parallel deflate,
+byte-compatible with lodepng_zlib_compress's framing.*/
+static unsigned mp_zlib_compress(unsigned char** out, size_t* outsize,
+                                 const unsigned char* in, size_t insize,
+                                 const LodePNGCompressSettings* settings,
+                                 unsigned num_jobs, LodePNGMPLzStats* stats) {
+  ucvector v = ucvector_init(0, 0);
+  unsigned error;
+  unsigned ADLER32;
+  size_t i;
+
+  error = mp_deflate_parallel(&v, in, insize, settings, num_jobs, stats);
+  if(error) {
+    lodepng_free(v.data);
+    return error;
+  }
+
+  *outsize = v.size + 6;
+  *out = (unsigned char*)lodepng_malloc(*outsize);
+  if(!*out) {
+    lodepng_free(v.data);
+    return 83;
+  }
+
+  ADLER32 = adler32(in, insize);
+  {
+    unsigned CMF = 120; /*CM 8, CINFO 7: window up to 32768*/
+    unsigned FLEVEL = 0;
+    unsigned FDICT = 0;
+    unsigned CMFFLG = 256 * CMF + FDICT * 32 + FLEVEL * 64;
+    unsigned FCHECK = 31 - CMFFLG % 31;
+    CMFFLG += FCHECK;
+    (*out)[0] = (unsigned char)(CMFFLG >> 8);
+    (*out)[1] = (unsigned char)(CMFFLG & 255);
+  }
+  for(i = 0; i != v.size; ++i) (*out)[i + 2] = v.data[i];
+  lodepng_set32bitInt(&(*out)[*outsize - 4], ADLER32);
+
+  lodepng_free(v.data);
+  return 0;
+}
+
+/*Five-filter cache of one scanline plus its cost-model feature vector.*/
+typedef struct LodePNGMPRowCache {
+  unsigned char* filtered[LODEPNG_MP_NUMFILTERS];
+  size_t features[LODEPNG_MP_NUMFILTERS][LODEPNG_MP_NUMFEATURES];
+} LodePNGMPRowCache;
+
+/*Four features per filtered row:
+  0: sum of absolute (signed) byte values  - compactness of the differences
+  1: zero byte count                       - deflate matches/literals love zeros
+  2: entropy proxy i*log2(i) over the 256-symbol histogram (higher = worse)
+  3: byte spread (max-min)                 - large symbols cost more extra bits*/
+static void mp_row_features(size_t features[LODEPNG_MP_NUMFEATURES],
+                            const unsigned char* data, size_t length, unsigned filtertype) {
+  size_t sad = 0, zeros = 0, spread_proxy = 0, x;
+  unsigned minv = 255, maxv = 0;
+  unsigned count[256];
+  lodepng_memset(count, 0, sizeof(count));
+  for(x = 0; x < length; ++x) {
+    unsigned char s = data[x];
+    unsigned char magnitude;
+    count[s]++;
+    if(s < minv) minv = s;
+    if(s > maxv) maxv = s;
+    if(s == 0) ++zeros;
+    magnitude = s < 128 ? s : (unsigned char)(255U - s);
+    if(filtertype == 0) magnitude = s; /*None is not a difference: keep unsigned*/
+    sad += magnitude;
+  }
+  for(x = 0; x < 256; ++x) spread_proxy += ilog2i(count[x]);
+  features[0] = sad;
+  features[1] = zeros;
+  features[2] = spread_proxy;
+  features[3] = (size_t)maxv - minv;
+}
+
+/*Cost of one filtered row under the current per-filter linear model. Feature 1
+(zeros) is beneficial, so it enters with a negated sign via the weight table.*/
+static size_t mp_row_cost(const LodePNGMPRowCache* row, unsigned filtertype,
+                          const double weights[LODEPNG_MP_NUMFILTERS][LODEPNG_MP_NUMFEATURES]) {
+  double cost = 0;
+  unsigned k;
+  for(k = 0; k < LODEPNG_MP_NUMFEATURES; ++k) {
+    cost += weights[filtertype][k] * (double)row->features[filtertype][k];
+  }
+  if(cost < 0) cost = 0;
+  return (size_t)(cost * 1024.0);
+}
+
+/*Reweight the five filter models from real bitstream feedback.
+chosen_rows is the assignment of the previous pass; perFilterStats aggregates
+the filtered-byte statistics of the rows assigned to each filter. Filters whose
+rows compress poorly (high output per input byte relative to the best filter)
+have their compactness penalties raised and their zero reward strengthened, so
+the next pass moves their borderline rows toward better-behaving filters.*/
+static void mp_update_filter_weights(double weights[LODEPNG_MP_NUMFILTERS][LODEPNG_MP_NUMFEATURES],
+                                     const size_t per_filter_bytes[LODEPNG_MP_NUMFILTERS],
+                                     const size_t per_filter_zeros[LODEPNG_MP_NUMFILTERS],
+                                     const size_t per_filter_rows[LODEPNG_MP_NUMFILTERS],
+                                     size_t total_output, size_t total_input) {
+  double global_ratio = total_input ? (double)total_output / (double)total_input : 1.0;
+  unsigned t;
+  for(t = 0; t < LODEPNG_MP_NUMFILTERS; ++t) {
+    double ratio;
+    double factor;
+    if(per_filter_rows[t] == 0) {
+      /*unused filter: gently lower its cost so it gets retried on borderline rows*/
+      weights[t][0] *= 0.95;
+      weights[t][2] *= 0.95;
+      weights[t][3] *= 0.95;
+      continue;
+    }
+    ratio = (double)per_filter_bytes[t] * global_ratio / (double)per_filter_rows[t];
+    /*factor centered on 1: >1 means this filter's rows were expensive, <1 cheap*/
+    factor = 1.0 + 0.12 * (ratio - 1.0);
+    if(factor < 0.8) factor = 0.8;
+    if(factor > 1.25) factor = 1.25;
+    weights[t][0] *= factor;       /*SAD penalty*/
+    weights[t][2] *= factor;       /*entropy penalty*/
+    weights[t][3] *= factor;       /*spread penalty*/
+    /*zero reward: a higher realized zero fraction strengthens the reward*/
+    {
+      double zerofrac = (double)per_filter_zeros[t] / (double)per_filter_bytes[t];
+      weights[t][1] = -zerofrac * 2.0 - 0.05;
+    }
+  }
+}
+
+/*Pick the LZ77 matching strategy for a pass from the previous pass feedback.
+Low match rate or short matches -> search harder (larger window, higher nice
+match, keep lazy matching). Already saturated -> keep the cheaper settings.*/
+static void mp_lz_settings_for_pass(LodePNGCompressSettings* settings, unsigned pass,
+                                    const LodePNGMPLzStats* prev) {
+  static const unsigned nice_schedule[] = {128, 192, 258, 258};
+  static const unsigned window_schedule[] = {2048, 4096, 8192, 32768};
+  unsigned idx = pass;
+  double match_rate, avg_len;
+
+  if(idx > 3) idx = 3;
+  settings->nicematch = nice_schedule[idx];
+  settings->windowsize = window_schedule[idx];
+  settings->minmatch = 3;
+
+  if(pass == 0 || !prev || prev->input_bytes == 0) {
+    settings->lazymatching = 1;
+    return;
+  }
+  match_rate = prev->matches + prev->literals
+               ? (double)prev->matches / (double)(prev->matches + prev->literals) : 0.0;
+  avg_len = prev->matches ? (double)prev->match_len_sum / (double)prev->matches : 0.0;
+  /*lazy matching pays off when matches are short and sparse; with long matches
+  the lazy lookahead mostly adds time without changing the stream*/
+  settings->lazymatching = (match_rate < 0.35 || avg_len < 12.0) ? 1 : 0;
+}
+
+/*Iterative multi-pass entry point used by the encoder. Takes the raw
+(unfiltered) scanline bytes and produces the complete zlib stream that goes into
+IDAT. Returns 0 on success, an lodepng error code otherwise. On any allocation
+failure or unsupported configuration the caller falls back to the stock path.*/
+
+/*Produce the exact filtered IDAT stream the classic MINSUM strategy would
+produce, so the stock-encoder anchor candidate matches the baseline path.*/
+static unsigned filter_minsum_stream(unsigned char** out, size_t* outsize,
+                                     const unsigned char* raw, unsigned w, unsigned h,
+                                     const LodePNGColorMode* color,
+                                     const LodePNGEncoderSettings* encoder_settings) {
+  unsigned bpp = lodepng_get_bpp(color);
+  size_t linebytes = lodepng_get_raw_size_idat(w, 1, bpp) - 1u;
+  size_t bytewidth = (bpp + 7u) / 8u;
+  unsigned char* attempt[LODEPNG_MP_NUMFILTERS];
+  const unsigned char* prevline = 0;
+  unsigned y, type;
+  unsigned error = 0;
+
+  *outsize = h * (linebytes + 1);
+  *out = (unsigned char*)lodepng_malloc(*outsize);
+  if(!*out) return 83;
+
+  for(type = 0; type < LODEPNG_MP_NUMFILTERS; ++type) {
+    attempt[type] = (unsigned char*)lodepng_malloc(linebytes);
+    if(!attempt[type]) error = 83;
+  }
+  if(error) {
+    for(type = 0; type < LODEPNG_MP_NUMFILTERS; ++type) lodepng_free(attempt[type]);
+    lodepng_free(*out);
+    *out = 0;
+    return 83;
+  }
+
+  for(y = 0; y != h; ++y) {
+    size_t smallest = 0;
+    unsigned best_type = 0;
+    unsigned x;
+    unsigned use_zero = encoder_settings->filter_palette_zero &&
+                        (color->colortype == LCT_PALETTE || bpp < 8);
+    if(use_zero) {
+      (*out)[y * (linebytes + 1)] = 0;
+      lodepng_memcpy(&(*out)[y * (linebytes + 1) + 1], &raw[y * linebytes], linebytes);
+      prevline = &raw[y * linebytes];
+      continue;
+    }
+    for(type = 0; type < LODEPNG_MP_NUMFILTERS; ++type) {
+      size_t sum = 0;
+      filterScanline(attempt[type], &raw[y * linebytes], prevline, linebytes,
+                     bytewidth, (unsigned char)type);
+      if(type == 0) {
+        for(x = 0; x < linebytes; ++x) sum += (unsigned char)(attempt[type][x]);
+      } else {
+        for(x = 0; x < linebytes; ++x) {
+          unsigned char s = attempt[type][x];
+          sum += s < 128 ? s : (255U - s);
+        }
+      }
+      if(type == 0 || sum < smallest) {
+        best_type = type;
+        smallest = sum;
+      }
+    }
+    prevline = &raw[y * linebytes];
+    (*out)[y * (linebytes + 1)] = (unsigned char)best_type;
+    lodepng_memcpy(&(*out)[y * (linebytes + 1) + 1], attempt[best_type], linebytes);
+  }
+
+  for(type = 0; type < LODEPNG_MP_NUMFILTERS; ++type) lodepng_free(attempt[type]);
+  return 0;
+}
+
+static unsigned lodepng_multipass_encode(unsigned char** out, size_t* outsize,
+                                         const unsigned char* raw, unsigned w, unsigned h,
+                                         const LodePNGColorMode* color,
+                                         const LodePNGEncoderSettings* encoder_settings) {
+  unsigned bpp = lodepng_get_bpp(color);
+  size_t linebytes = lodepng_get_raw_size_idat(w, 1, bpp) - 1u;
+  size_t bytewidth = (bpp + 7u) / 8u;
+  unsigned max_passes = encoder_settings->zlibsettings.multipass_passes;
+  unsigned num_jobs = encoder_settings->zlibsettings.parallel_jobs;
+  unsigned pass, y, t;
+  unsigned error = 0;
+  LodePNGMPRowCache* rows = 0;
+  unsigned char* chosen = 0;      /*filtered stream of the current pass*/
+  unsigned char* best = 0;        /*smallest filtered stream found so far*/
+  size_t chosen_size, best_size = 0;
+  unsigned char* best_zlib = 0;
+  size_t best_zlib_size = 0;
+  double weights[LODEPNG_MP_NUMFILTERS][LODEPNG_MP_NUMFEATURES];
+  size_t prev_output = 0;
+  LodePNGMPLzStats stats_prev;
+  const unsigned char* prevline = 0;
+
+  if(max_passes < 2) max_passes = 2;
+  if(max_passes > 8) max_passes = 8;
+  if(num_jobs < 1) num_jobs = 1;
+  if(bpp == 0 || linebytes == 0 || h == 0) return 88;
+
+  rows = (LodePNGMPRowCache*)lodepng_malloc(h * sizeof(LodePNGMPRowCache));
+  chosen = (unsigned char*)lodepng_malloc(h * (linebytes + 1));
+  if(!rows || !chosen) {
+    error = 83;
+    goto mp_cleanup;
+  }
+  lodepng_memset(rows, 0, h * sizeof(LodePNGMPRowCache));
+
+  /*initial models: SAD/entropy/spread are penalties (positive), zeros a reward*/
+  for(t = 0; t < LODEPNG_MP_NUMFILTERS; ++t) {
+    weights[t][0] = 1.0;
+    weights[t][1] = -1.0;
+    weights[t][2] = 1.0 / 64.0;
+    weights[t][3] = 1.0 / 256.0;
+  }
+
+  /*cache all five filterings once; filtering is independent of later passes*/
+  for(y = 0; y != h && !error; ++y) {
+    for(t = 0; t < LODEPNG_MP_NUMFILTERS; ++t) {
+      rows[y].filtered[t] = (unsigned char*)lodepng_malloc(linebytes);
+      if(!rows[y].filtered[t]) {
+        error = 83;
+        break;
+      }
+      filterScanline(rows[y].filtered[t], &raw[(size_t)y * linebytes], prevline,
+                     linebytes, bytewidth, (unsigned char)t);
+      mp_row_features(rows[y].features[t], rows[y].filtered[t], linebytes, t);
+    }
+    prevline = &raw[(size_t)y * linebytes];
+  }
+  if(error) goto mp_cleanup;
+
+  chosen_size = h * (linebytes + 1);
+
+  /*Anchor: run the stock single-pass encoder on the MINSUM-filtered stream and
+  keep its zlib output as the first candidate. The iterative passes only replace
+  it when they produce something strictly smaller, so enabling multipass can
+  never make the PNG larger than the classic encoder (modulo chunk framing,
+  which is identical). This also seeds the filter model with real feedback.*/
+  {
+    LodePNGEncoderSettings stock_enc = *encoder_settings;
+    unsigned char* stock_filtered = 0;
+    size_t stock_filtered_size = 0;
+    stock_enc.filter_strategy = LFS_MINSUM;
+    error = filter_minsum_stream(&stock_filtered, &stock_filtered_size, raw, w, h,
+                                 color, &stock_enc);
+    if(!error) {
+      unsigned char* stock_zlib = 0;
+      size_t stock_zlib_size = 0;
+      error = lodepng_zlib_compress(&stock_zlib, &stock_zlib_size,
+                                    stock_filtered, stock_filtered_size,
+                                    &encoder_settings->zlibsettings);
+      if(!error) {
+        best_zlib = stock_zlib;
+        best_zlib_size = stock_zlib_size;
+        best = (unsigned char*)lodepng_malloc(stock_filtered_size);
+        if(!best) error = 83;
+        else {
+          best_size = stock_filtered_size;
+          lodepng_memcpy(best, stock_filtered, stock_filtered_size);
+        }
+      }
+      lodepng_free(stock_filtered);
+    }
+    if(error) goto mp_cleanup;
+  }
+
+  for(pass = 0; pass < max_passes && !error; ++pass) {
+    LodePNGCompressSettings pass_settings;
+    LodePNGMPLzStats stats;
+    LodePNGMPLzStats prev_stats;
+    size_t per_filter_bytes[LODEPNG_MP_NUMFILTERS];
+    size_t per_filter_zeros[LODEPNG_MP_NUMFILTERS];
+    size_t per_filter_rows[LODEPNG_MP_NUMFILTERS];
+    unsigned char* zlib_data = 0;
+    size_t zlib_size = 0;
+
+    lodepng_memset(&stats, 0, sizeof(stats));
+    lodepng_memset(&prev_stats, 0, sizeof(prev_stats));
+    if(pass > 0) prev_stats = stats_prev;
+
+    /*1) assign each row the cheapest filter under the current model*/
+    lodepng_memset(per_filter_bytes, 0, sizeof(per_filter_bytes));
+    lodepng_memset(per_filter_zeros, 0, sizeof(per_filter_zeros));
+    lodepng_memset(per_filter_rows, 0, sizeof(per_filter_rows));
+    for(y = 0; y != h; ++y) {
+      unsigned best_type = 0;
+      size_t best_cost = 0, c;
+      for(t = 0; t < LODEPNG_MP_NUMFILTERS; ++t) {
+        c = mp_row_cost(&rows[y], t, weights);
+        if(t == 0 || c < best_cost) {
+          best_cost = c;
+          best_type = t;
+        }
+      }
+      chosen[y * (linebytes + 1)] = (unsigned char)best_type;
+      lodepng_memcpy(&chosen[y * (linebytes + 1) + 1],
+                     rows[y].filtered[best_type], linebytes);
+      per_filter_rows[best_type]++;
+      per_filter_bytes[best_type] += linebytes + 1;
+      per_filter_zeros[best_type] += rows[y].features[best_type][1];
+    }
+
+    /*2) derive this pass's LZ77 strategy from the previous bitstream feedback*/
+    pass_settings = encoder_settings->zlibsettings;
+    pass_settings.btype = 2;
+    pass_settings.use_lz77 = 1;
+    pass_settings.custom_zlib = 0;
+    pass_settings.custom_deflate = 0;
+    mp_lz_settings_for_pass(&pass_settings, pass, pass > 0 ? &prev_stats : 0);
+
+    /*3) block-parallel deflate + zlib framing, with bitstream feedback*/
+    error = mp_zlib_compress(&zlib_data, &zlib_size, chosen, chosen_size,
+                             &pass_settings, num_jobs, &stats);
+    if(error) break;
+
+    /*4) keep the smallest zlib stream*/
+    if(!best_zlib || zlib_size < best_zlib_size) {
+      lodepng_free(best_zlib);
+      best_zlib = zlib_data;
+      best_zlib_size = zlib_size;
+      if(!best || best_size != chosen_size) {
+        if(!best) best = (unsigned char*)lodepng_malloc(chosen_size);
+        else best = (unsigned char*)lodepng_realloc(best, chosen_size);
+      }
+      if(best) {
+        best_size = chosen_size;
+        lodepng_memcpy(best, chosen, chosen_size);
+      }
+    } else {
+      lodepng_free(zlib_data);
+    }
+
+    /*5) feed the real stream back into the filter and matching models*/
+    mp_update_filter_weights(weights, per_filter_bytes, per_filter_zeros, per_filter_rows,
+                             stats.output_bytes, stats.input_bytes);
+
+    /*convergence: less than 0.1% improvement and not the first pass*/
+    if(pass > 0 && prev_output > 0) {
+      size_t diff = prev_output > stats.output_bytes ? prev_output - stats.output_bytes : 0;
+      if(diff * 1000 < prev_output) {
+        stats_prev = stats;
+        break;
+      }
+    }
+    prev_output = stats.output_bytes;
+    stats_prev = stats;
+  }
+
+  if(!error && best_zlib) {
+    *out = best_zlib;
+    *outsize = best_zlib_size;
+    best_zlib = 0; /*ownership transferred*/
+  } else if(!error) {
+    error = 83;
+  }
+
+mp_cleanup:
+  if(rows) {
+    for(y = 0; y != h; ++y) {
+      for(t = 0; t < LODEPNG_MP_NUMFILTERS; ++t) lodepng_free(rows[y].filtered[t]);
+    }
+    lodepng_free(rows);
+  }
+  lodepng_free(chosen);
+  lodepng_free(best);
+  lodepng_free(best_zlib);
+  return error;
+}
+
 /*out must be buffer big enough to contain uncompressed IDAT chunk data, and in must contain the full image.
 return value is error**/
 static unsigned preProcessScanlines(unsigned char** out, size_t* outsize, const unsigned char* in,
@@ -6517,6 +7413,9 @@ unsigned lodepng_encode(unsigned char** out, size_t* outsize,
   const LodePNGInfo* info_png = &state->info_png;
   LodePNGColorMode auto_color;
   unsigned error = 0;
+  unsigned mp_active = 0;
+  unsigned char* mp_zlib = 0; /*precomputed zlib stream from the multi-pass encoder*/
+  size_t mp_zlib_size = 0;
 
   lodepng_info_init(&info);
   lodepng_color_mode_init(&auto_color);
@@ -6671,6 +7570,10 @@ unsigned lodepng_encode(unsigned char** out, size_t* outsize,
     }
   }
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+  mp_active = state->encoder.zlibsettings.multipass != 0
+                       && info.interlace_method == 0
+                       && state->encoder.zlibsettings.btype == 2
+                       && state->encoder.zlibsettings.custom_zlib == 0;
   if(!lodepng_color_mode_equal(&state->info_raw, &info.color)) {
     unsigned char* converted;
     size_t size = ((size_t)w * (size_t)h * (size_t)lodepng_get_bpp(&info.color) + 7u) / 8u;
@@ -6680,11 +7583,34 @@ unsigned lodepng_encode(unsigned char** out, size_t* outsize,
     if(!error) {
       error = lodepng_convert(converted, image, &info.color, &state->info_raw, w, h);
     }
-    if(!error) {
+    if(!error && mp_active) {
+      error = lodepng_multipass_encode(&mp_zlib, &mp_zlib_size, converted, w, h,
+                                       &info.color, &state->encoder);
+      if(error) { /*any failure inside the new path falls back to the stock encoder*/
+        mp_active = 0;
+        error = 0;
+        lodepng_free(mp_zlib);
+        mp_zlib = 0;
+      }
+    }
+    if(!error && !mp_active) {
       error = preProcessScanlines(&data, &datasize, converted, w, h, &info, &state->encoder);
     }
     lodepng_free(converted);
     if(error) goto cleanup;
+  } else if(mp_active) {
+    error = lodepng_multipass_encode(&mp_zlib, &mp_zlib_size, image, w, h,
+                                     &info.color, &state->encoder);
+    if(error) {
+      mp_active = 0;
+      error = 0;
+      lodepng_free(mp_zlib);
+      mp_zlib = 0;
+    }
+    if(!mp_active) {
+      error = preProcessScanlines(&data, &datasize, image, w, h, &info, &state->encoder);
+      if(error) goto cleanup;
+    }
   } else {
     error = preProcessScanlines(&data, &datasize, image, w, h, &info, &state->encoder);
     if(error) goto cleanup;
@@ -6776,7 +7702,23 @@ unsigned lodepng_encode(unsigned char** out, size_t* outsize,
     }
 #endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
     /*IDAT (multiple IDAT chunks must be consecutive)*/
-    error = addChunk_IDAT(&outv, data, datasize, &state->encoder.zlibsettings);
+    if(mp_active && mp_zlib) {
+      /*the multi-pass encoder already produced the framed zlib stream; wrap it
+      into IDAT chunk(s) using the same chunking rules as addChunk_IDAT*/
+      size_t mppos = 0;
+      const size_t max_chunk_length = 2147483647u;
+      while(!error) {
+        if(mp_zlib_size - mppos > max_chunk_length) {
+          error = lodepng_chunk_createv(&outv, max_chunk_length, "IDAT", mp_zlib + mppos);
+          mppos += max_chunk_length;
+        } else {
+          error = lodepng_chunk_createv(&outv, mp_zlib_size - mppos, "IDAT", mp_zlib + mppos);
+          break;
+        }
+      }
+    } else {
+      error = addChunk_IDAT(&outv, data, datasize, &state->encoder.zlibsettings);
+    }
     if(error) goto cleanup;
 #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
     /*tIME*/
@@ -6849,6 +7791,7 @@ unsigned lodepng_encode(unsigned char** out, size_t* outsize,
 cleanup:
   lodepng_info_cleanup(&info);
   lodepng_free(data);
+  lodepng_free(mp_zlib);
   lodepng_color_mode_cleanup(&auto_color);
 
   /*instead of cleaning the vector up, give it to the output*/

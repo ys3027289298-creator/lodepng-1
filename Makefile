@@ -30,5 +30,24 @@ pngdetail: lodepng.o lodepng_util.o pngdetail.o
 showpng: lodepng.o examples/example_sdl.o
 	$(CXX) -I ./ $^ $(CXXFLAGS) -lSDL2 -o $@
 
+# Multi-pass iterative encoder benchmark. Enable the block-parallel path with
+# ENABLE_PTHREAD=1 (needs -pthread). Run via bench/run_bench.sh, which also
+# generates the 12 test images and does the independent read-back checks.
+MP_CXXFLAGS := -W -Wall -Wextra -O3 -std=c++11
+ifeq ($(ENABLE_PTHREAD),1)
+MP_CXXFLAGS += -DLODEPNG_USE_PTHREAD -pthread
+endif
+
+bench/lodepng_mp.o: lodepng.cpp lodepng.h
+	@mkdir -p bench
+	$(CXX) -I ./ $(MP_CXXFLAGS) -c lodepng.cpp -o $@
+
+multipass_bench: bench/lodepng_mp.o bench/bench_multipass.o
+	$(CXX) -I ./ $^ $(MP_CXXFLAGS) -o $@
+
+bench/%.o: bench/%.cpp
+	@mkdir -p `dirname $@`
+	$(CXX) -I ./ $(MP_CXXFLAGS) -c $< -o $@
+
 clean:
-	rm -f unittest benchmark pngdetail showpng lodepng_unittest.o lodepng_benchmark.o lodepng.o lodepng_util.o pngdetail.o examples/example_sdl.o
+	rm -f unittest benchmark pngdetail showpng multipass_bench lodepng_unittest.o lodepng_benchmark.o lodepng.o lodepng_util.o pngdetail.o examples/example_sdl.o bench/*.o
